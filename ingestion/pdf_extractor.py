@@ -1,17 +1,3 @@
-"""
-pdf_extractor.py
-
-Digital PDF text extraction module.
-
-Responsibilities:
-- Extract text from PDF pages using pdfminer.six
-- Analyze page text length
-- Detect pages that are likely scanned
-- Return extracted text + scanned page numbers
-
-Used by:
-DocumentRouter -> OcrExtractor
-"""
 
 from pathlib import Path
 

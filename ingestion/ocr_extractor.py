@@ -1,31 +1,4 @@
-"""
-ocr_extractor.py
 
-Scanned PDF OCR pipeline.
-
-Responsibilities:
-- Convert PDF pages into images using pdf2image
-- Improve image quality using OpenCV
-- Extract text using Tesseract OCR
-- Return page-wise OCR text
-
-Pipeline:
-
-PDF
- |
- ▼
-pdf2image (300 DPI)
- |
- ▼
-OpenCV preprocessing
- |
- ▼
-Tesseract OCR
- |
- ▼
-Combined document text
-
-"""
 
 
 from pathlib import Path

@@ -49,7 +49,8 @@ pip install pdfminer.six
 ## Purpose
 
 Acts as the first stage of the document processing pipeline and routes scanned pages to `ocr_extractor.py` for OCR-based extraction.
-<img width="1591" height="319" alt="Screenshot 2026-08-07 210747" src="https://github.com/user-attachments/assets/26ec2ba0-a615-4bbd-81f7-ca1c6f5d31cd" />
+<img width="1145" height="390" alt="Screenshot 2026-08-07 211125" src="https://github.com/user-attachments/assets/11bf89c2-b6f6-43d2-89c2-6c873ea90f01" />
+
 
 
 

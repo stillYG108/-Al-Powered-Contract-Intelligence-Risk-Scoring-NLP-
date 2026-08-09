@@ -11,45 +11,56 @@ training artifact formats:
     1. spaCy DocBin  (.spacy binary) → consumed by ner/train.py
     2. Clause JSON   (.json)         → consumed by Phase-2 transformer fine-tuning
 
-This package knows about CUAD's structure and training formats.
-It does NOT know about extractors, models, or the API layer.
-
 PIPELINE OVERVIEW
 -----------------
-    HuggingFace CUAD dataset
+    HuggingFace CUAD dataset  (or local CUADv1.json)
             │
             ▼
-    CuadLoader.load()              → list[dict]  (raw CUAD samples)
+    CuadLoader.load()              → (train_samples, dev_samples)
             │
-            ├──▶ CuadToNer.convert()         → list[NERSample]
-            │         │
-            │         ▼
-            │   SpanValidator.validate()     → cleaned list[NERSample]
-            │         │
-            │         ▼
-            │   DocBin → cuad_ner_train.spacy / cuad_ner_dev.spacy
+            ├──▶ CuadToNer.convert()         → cuad_ner_train.spacy / cuad_ner_dev.spacy
+            │         └── SpanValidator      → cleaned, non-overlapping NER spans
             │
-            └──▶ CuadToClassification.convert()  → list[ClauseSample]
-                        │
-                        ▼
-                  cuad_clauses_train.json / cuad_clauses_dev.json
+            └──▶ CuadToClassification.convert()
+                        └── cuad_clauses_train.json / cuad_clauses_dev.json
 
-INTERNAL MODULES
-----------------
-    base.py                     BaseConverter Protocol
-    cuad_loader.py              CUAD dataset loading + train/dev split
-    cuad_to_ner.py              CUAD Q&A → spaCy NER spans
-    cuad_to_classification.py   CUAD Q&A → clause classification JSON
-    span_validator.py           Overlapping span resolution
-    dataset_stats.py            Distribution statistics + reports
-
-PUBLIC API (what callers import)
----------------------------------
+PUBLIC API
+----------
     from data_processing import load_cuad, build_ner_corpus, build_clause_corpus
 """
 
-from data_processing.cuad_loader import load_cuad
-from data_processing.cuad_to_ner import build_ner_corpus
-from data_processing.cuad_to_classification import build_clause_corpus
+from data_processing.cuad_loader import load_cuad, CuadLoader
+from data_processing.cuad_to_ner import CuadToNer
+from data_processing.cuad_to_classification import CuadToClassification
+from data_processing.span_validator import SpanValidator, Entity, SpanConflict
 
-__all__ = ["load_cuad", "build_ner_corpus", "build_clause_corpus"]
+
+def build_ner_corpus(
+    train_samples: list[dict],
+    dev_samples:   list[dict],
+    output_dir:    str = "data/processed",
+) -> dict:
+    """Convert CUAD samples → spaCy DocBin (.spacy files)."""
+    return CuadToNer().convert(train_samples, dev_samples, output_dir)
+
+
+def build_clause_corpus(
+    train_samples: list[dict],
+    dev_samples:   list[dict],
+    output_dir:    str = "data/processed",
+) -> dict:
+    """Convert CUAD samples → clause classification JSON Lines."""
+    return CuadToClassification().convert(train_samples, dev_samples, output_dir)
+
+
+__all__ = [
+    "load_cuad",
+    "CuadLoader",
+    "CuadToNer",
+    "CuadToClassification",
+    "SpanValidator",
+    "Entity",
+    "SpanConflict",
+    "build_ner_corpus",
+    "build_clause_corpus",
+]

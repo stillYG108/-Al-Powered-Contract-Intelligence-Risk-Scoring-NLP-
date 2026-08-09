@@ -1,287 +1,357 @@
 """
 data_processing/cuad_to_ner.py
-===============================
-Converts CUAD Q&A annotations into spaCy NER training data.
+================================
+Converts CUAD QA annotations → spaCy NER training format (DocBin).
 
-PURPOSE
--------
-Transforms raw CUAD samples (Q&A format) into spaCy-compatible NER
-training examples stored as a DocBin binary file.
+ENTITY LABEL MAPPING (from phase_01_tasks.md)
+----------------------------------------------
+CUAD Question Type          → NER Label
+------------------------------------------
+Parties                     → ORG
+Governing Law               → LAW_JURISDICTION
+Effective Date              → DATE
+Expiration Date             → DATE
+Agreement Date              → DATE
+Notice Period to Terminate  → DURATION
+Minimum Commitment          → MONEY
+Revenue/Profit Sharing      → MONEY
+Cap On Liability            → MONEY
+Liquidated Damages          → MONEY
+Warranty Duration           → DURATION
+Renewal Term                → DURATION
+Non-Compete                 → CLAUSE
+Exclusivity                 → CLAUSE
+Termination For Convenience → CLAUSE
+Anti-Assignment             → CLAUSE
+Change Of Control           → CLAUSE
+IP Ownership Assignment     → IP_CLAUSE
+License Grant               → IP_CLAUSE
+Source Code Escrow          → IP_CLAUSE
+Governing Law               → LAW_JURISDICTION
+(all remaining 35 clause types) → CLAUSE
 
-OUTPUT FORMAT
--------------
-Two spaCy DocBin files:
-    data/processed/cuad_ner_train.spacy
-    data/processed/cuad_ner_dev.spacy
+OUTPUT
+------
+cuad_ner_train.spacy  — spaCy DocBin (binary format)
+cuad_ner_dev.spacy    — spaCy DocBin (binary format)
 
-Each DocBin contains spaCy Doc objects with .ents set.
-These are loaded directly by `spacy train` via the training config.
-
-MAPPING STRATEGY: CUAD Q → EntityLabel
-----------------------------------------
-CUAD question text is matched to an EntityLabel via the question-to-label
-lookup table (QUESTION_TO_LABEL dict below).
-
-Each CUAD question template contains a unique phrase (e.g.,
-"Highlight the parts...related to parties" → EntityLabel.PARTIES).
-
-All 41 CUAD clause types are mapped (Phase 1 decision).
-The 4 core NER types (ORG, DATE, MONEY, GPE) are ALSO included by
-running spaCy's base model (en_core_web_lg) on each text and adding
-those entities to the training set. This gives the model dual training
-signal: CUAD-derived labels + pre-existing NER knowledge.
-
-CHUNKING STRATEGY
------------------
-CUAD contexts can be very long (10,000+ chars). spaCy NER works on
-chunks of up to max_text_length chars (default: 512).
-
-Chunking algorithm:
-    1. Split context at sentence boundaries (using spaCy sentenciser)
-    2. Accumulate sentences until chunk size <= max_text_length
-    3. Adjust entity offsets to be relative to chunk start
-    4. Discard chunks with no entity spans (negative examples configurable)
-
-SPAN ALIGNMENT
---------------
-CUAD answer_start offsets are character-based and refer to the FULL context.
-After chunking, offsets must be adjusted:
-    chunk_start_offset = entity.start - chunk_char_start
-    chunk_end_offset   = entity.end   - chunk_char_start
-
-All spans are validated by SpanValidator before being written to DocBin.
-
-NEGATIVE EXAMPLES
------------------
-CUAD includes many "no answer" examples (empty answers.text list).
-Strategy: include 1 negative example for every 3 positive examples (ratio=0.33).
-This prevents the model from biasing toward always predicting an entity.
-
-IMPLEMENTATION NOTES
---------------------
-- Use spacy.blank("en") to create Doc objects (no model needed for DocBin)
-- Use doc.set_ents() with spans derived from character offsets
-- Use DocBin.add(doc) in a loop, then DocBin.to_disk(path)
-- Log progress with tqdm over the sample list
-- Log per-label entity counts after conversion (for dataset_stats integration)
-
-USAGE EXAMPLE
--------------
-    from data_processing.cuad_to_ner import CuadToNer
-    from pathlib import Path
-
-    converter = CuadToNer()
-    ner_samples = converter.convert(train_samples)
-
-    # Module-level convenience:
-    from data_processing import build_ner_corpus
-    build_ner_corpus(train_samples, dev_samples, output_dir=Path("data/processed"))
+One spaCy Doc per contract (not per QA pair).
+All entity spans from all 41 questions are merged into a single entity list
+per contract, then validated by SpanValidator before writing to DocBin.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
-from core.exceptions import ConversionError  # noqa: F401
-from core.logging import get_logger
-from core.types import Entity, EntityLabel, NERSample
+logger = logging.getLogger(__name__)
 
-log = get_logger(__name__)
+# ─────────────────────────────────────────────────────────────────────────────
+# Entity label mapping  (spec §1.2)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# CUAD question text → EntityLabel mapping
-# (all 41 clause types — Phase 1 decision)
-# ---------------------------------------------------------------------------
-#
-# Each key is a UNIQUE substring of the CUAD question template.
-# Matching is done with str.lower() + 'key in question.lower()'.
-# Keys are ordered from most specific to least specific to avoid
-# false matches (e.g., "termination for convenience" before "termination").
-#
+# Maps a substring of the CUAD question text → NER label
+# Matching is done by checking if the key appears in question.lower()
 QUESTION_TO_LABEL: dict[str, str] = {
-    "document name":                    EntityLabel.DOCUMENT_NAME.value,
-    "parties":                          EntityLabel.PARTIES.value,
-    "agreement date":                   EntityLabel.AGREEMENT_DATE.value,
-    "effective date":                   EntityLabel.EFFECTIVE_DATE.value,
-    "expiration date":                  EntityLabel.EXPIRATION_DATE.value,
-    "renewal term":                     EntityLabel.RENEWAL_TERM.value,
-    "notice period to terminate":       EntityLabel.NOTICE_PERIOD_TO_TERMINATE.value,
-    "governing law":                    EntityLabel.GOVERNING_LAW.value,
-    "most favored nation":              EntityLabel.MOST_FAVORED_NATION.value,
-    "non-compete":                      EntityLabel.NON_COMPETE.value,
-    "exclusivity":                      EntityLabel.EXCLUSIVITY.value,
-    "no-solicit of customers":          EntityLabel.NO_SOLICIT_OF_CUSTOMERS.value,
-    "no-solicit of employees":          EntityLabel.NO_SOLICIT_OF_EMPLOYEES.value,
-    "non-disparagement":                EntityLabel.NON_DISPARAGEMENT.value,
-    "termination for convenience":      EntityLabel.TERMINATION_FOR_CONVENIENCE.value,
-    "rofr/rofo/rofn":                   EntityLabel.ROFR_ROFO_ROFN.value,
-    "change of control":                EntityLabel.CHANGE_OF_CONTROL.value,
-    "anti-assignment":                  EntityLabel.ANTI_ASSIGNMENT.value,
-    "revenue/profit sharing":           EntityLabel.REVENUE_PROFIT_SHARING.value,
-    "price restriction":                EntityLabel.PRICE_RESTRICTION.value,
-    "minimum commitment":               EntityLabel.MINIMUM_COMMITMENT.value,
-    "volume restriction":               EntityLabel.VOLUME_RESTRICTION.value,
-    "ip ownership assignment":          EntityLabel.IP_OWNERSHIP_ASSIGNMENT.value,
-    "joint ip ownership":               EntityLabel.JOINT_IP_OWNERSHIP.value,
-    "license grant":                    EntityLabel.LICENSE_GRANT.value,
-    "non-transferable license":         EntityLabel.NON_TRANSFERABLE_LICENSE.value,
-    "affiliate license-licensor":       EntityLabel.AFFILIATE_LICENSE_LICENSOR.value,
-    "affiliate license-licensee":       EntityLabel.AFFILIATE_LICENSE_LICENSEE.value,
-    "unlimited license":                EntityLabel.UNLIMITED_LICENSE.value,
-    "irrevocable or perpetual":         EntityLabel.IRREVOCABLE_OR_PERPETUAL.value,
-    "source code escrow":               EntityLabel.SOURCE_CODE_ESCROW.value,
-    "post-termination services":        EntityLabel.POST_TERMINATION_SERVICES.value,
-    "audit rights":                     EntityLabel.AUDIT_RIGHTS.value,
-    "uncapped liability":               EntityLabel.UNCAPPED_LIABILITY.value,
-    "cap on liability":                 EntityLabel.CAP_ON_LIABILITY.value,
-    "liquidated damages":               EntityLabel.LIQUIDATED_DAMAGES.value,
-    "warranty duration":                EntityLabel.WARRANTY_DURATION.value,
-    "insurance":                        EntityLabel.INSURANCE.value,
-    "covenant not to sue":              EntityLabel.COVENANT_NOT_TO_SUE.value,
-    "third party beneficiary":          EntityLabel.THIRD_PARTY_BENEFICIARY.value,
-    "limitation of liability":          EntityLabel.LIMITATION_OF_LIABILITY.value,
+    # Core labels (spec-required)
+    "parties":                          "ORG",
+    "governing law":                    "LAW_JURISDICTION",
+    "jurisdiction":                     "LAW_JURISDICTION",
+    "effective date":                   "DATE",
+    "expiration date":                  "DATE",
+    "agreement date":                   "DATE",
+    "notice period to terminate":       "DURATION",
+    "renewal term":                     "DURATION",
+    "warranty duration":                "DURATION",
+    "minimum commitment":               "MONEY",
+    "revenue/profit sharing":           "MONEY",
+    "cap on liability":                 "MONEY",
+    "liquidated damages":               "MONEY",
+    "price restrictions":               "MONEY",
+    # IP clauses
+    "ip ownership assignment":          "IP_CLAUSE",
+    "joint ip ownership":               "IP_CLAUSE",
+    "license grant":                    "IP_CLAUSE",
+    "non-transferable license":         "IP_CLAUSE",
+    "affiliate license":                "IP_CLAUSE",
+    "unlimited/all-you-can-eat":        "IP_CLAUSE",
+    "irrevocable or perpetual license": "IP_CLAUSE",
+    "source code escrow":               "IP_CLAUSE",
+    "covenant not to sue":              "IP_CLAUSE",
+    # Restrictive covenants
+    "non-compete":                      "CLAUSE",
+    "exclusivity":                      "CLAUSE",
+    "no-solicit of customers":          "CLAUSE",
+    "no-solicit of employees":          "CLAUSE",
+    "competitive restriction":          "CLAUSE",
+    "non-disparagement":                "CLAUSE",
+    "most favored nation":              "CLAUSE",
+    # Operational clauses
+    "termination for convenience":      "CLAUSE",
+    "anti-assignment":                  "CLAUSE",
+    "change of control":                "CLAUSE",
+    "rofr/rofo/rofn":                   "CLAUSE",
+    "post-termination services":        "CLAUSE",
+    "audit rights":                     "CLAUSE",
+    "volume restriction":               "CLAUSE",
+    "insurance":                        "CLAUSE",
+    "third party beneficiary":          "CLAUSE",
+    "uncapped liability":               "CLAUSE",
+    # Identity (document-level)
+    "document name":                    "CLAUSE",
 }
 
+# All 7 distinct NER labels used by the model
+ALL_NER_LABELS = [
+    "ORG",
+    "DATE",
+    "MONEY",
+    "DURATION",
+    "LAW_JURISDICTION",
+    "IP_CLAUSE",
+    "CLAUSE",
+]
 
-def build_ner_corpus(
-    train_samples: list[dict],
-    dev_samples: list[dict],
-    output_dir: Path,
-) -> None:
+
+def _question_to_label(question: str) -> str:
     """
-    Module-level function: convert + write DocBin files to disk.
+    Map a CUAD question string to an NER label.
 
-    Exported from data_processing/__init__.py.
-
-    Parameters
-    ----------
-    train_samples : list[dict]
-        Training split from CuadLoader.load()
-    dev_samples : list[dict]
-        Dev split from CuadLoader.load()
-    output_dir : Path
-        Directory where .spacy files will be written.
-        Files: {output_dir}/cuad_ner_train.spacy, cuad_ner_dev.spacy
-
-    Side Effects
-    ------------
-    - Writes two .spacy files to output_dir
-    - Logs counts: samples processed, entities found, spans discarded
+    Iterates QUESTION_TO_LABEL in order and returns the label for the first
+    matching key. Falls back to "CLAUSE" if no match found.
     """
-    # TODO (implementation)
-    pass
+    q_lower = question.lower()
+    for keyword, label in QUESTION_TO_LABEL.items():
+        if keyword in q_lower:
+            return label
+    return "CLAUSE"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main converter
+# ─────────────────────────────────────────────────────────────────────────────
 
 class CuadToNer:
     """
-    Converts CUAD Q&A samples to spaCy NER training examples.
+    Converts CUAD QA samples into spaCy DocBin NER training data.
 
-    Implements the BaseConverter Protocol.
+    Usage
+    -----
+        converter = CuadToNer()
+        converter.convert(
+            train_samples=train,
+            dev_samples=dev,
+            output_dir="data/processed/",
+        )
+        # Writes: cuad_ner_train.spacy  cuad_ner_dev.spacy
 
-    Parameters
-    ----------
-    max_chunk_length : int
-        Maximum character length per NER sample chunk.
-        Defaults to settings.max_text_length (512).
-    negative_ratio : float
-        Fraction of negative (no-entity) examples to include.
-        Default: 0.33 (1 negative per 3 positives).
+    Design
+    ------
+    - Groups samples by contract title (one Doc per contract)
+    - Merges all 41 QA answers into a single entity list per Doc
+    - Runs SpanValidator to clean overlapping/misaligned spans
+    - Writes spaCy DocBin binary format
     """
 
-    def __init__(
+    def __init__(self) -> None:
+        from data_processing.span_validator import SpanValidator
+        self.validator = SpanValidator()
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def convert(
         self,
-        max_chunk_length: int | None = None,
-        negative_ratio: float = 0.33,
-    ) -> None:
-        # TODO: load settings, store params
-        pass
-
-    def convert(self, samples: list[dict]) -> list[NERSample]:
+        train_samples: list[dict],
+        dev_samples:   list[dict],
+        output_dir:    str | Path = "data/processed",
+    ) -> dict:
         """
-        Convert raw CUAD dicts → list of NERSample.
-
-        Algorithm
-        ---------
-        1. For each sample:
-            a. Determine label: _map_question_to_label(sample["question"])
-            b. If label is None: skip (unknown question template) + log warning
-            c. Extract answer spans from sample["answers"]
-            d. Chunk the context into max_chunk_length pieces
-            e. For each chunk that overlaps with an answer span:
-                → Create Entity with adjusted offsets
-                → Run SpanValidator on the chunk's entities
-                → Create NERSample
-            f. Optionally include negative chunks (no answers) per negative_ratio
-        2. Return all NERSamples
-
-        Parameters
-        ----------
-        samples : list[dict]
-            Raw CUAD samples.
+        Convert and save both splits.
 
         Returns
         -------
-        list[NERSample]
-            Training examples with validated, non-overlapping entity spans.
-
-        Raises
-        ------
-        ConversionError
-            If > 5% of samples fail to convert (malformed data).
+        dict with keys: train_docs, dev_docs, total_entities, total_conflicts
         """
-        # TODO (implementation)
-        pass
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_label_set(self) -> set[str]:
-        """Return all EntityLabel values produced by this converter."""
-        return set(QUESTION_TO_LABEL.values())
+        train_stats = self._convert_split(
+            train_samples,
+            output_dir / "cuad_ner_train.spacy",
+            split_name="train",
+        )
+        dev_stats = self._convert_split(
+            dev_samples,
+            output_dir / "cuad_ner_dev.spacy",
+            split_name="dev",
+        )
 
-    def _map_question_to_label(self, question: str) -> str | None:
+        stats = {
+            "train_docs":        train_stats["docs"],
+            "dev_docs":          dev_stats["docs"],
+            "train_entities":    train_stats["entities"],
+            "dev_entities":      dev_stats["entities"],
+            "train_conflicts":   train_stats["conflicts"],
+            "dev_conflicts":     dev_stats["conflicts"],
+            "total_entities":    train_stats["entities"] + dev_stats["entities"],
+            "total_conflicts":   train_stats["conflicts"] + dev_stats["conflicts"],
+            "label_counts":      train_stats["label_counts"],
+        }
+
+        logger.info(
+            "NER conversion complete — "
+            "train_docs=%d dev_docs=%d "
+            "total_entities=%d total_conflicts=%d",
+            stats["train_docs"], stats["dev_docs"],
+            stats["total_entities"], stats["total_conflicts"],
+        )
+        return stats
+
+    # ── Internal: convert one split ───────────────────────────────────────
+
+    def _convert_split(
+        self,
+        samples:    list[dict],
+        output_path: Path,
+        split_name: str,
+    ) -> dict:
         """
-        Map a CUAD question string to an EntityLabel value.
-
-        Uses substring matching (case-insensitive) against QUESTION_TO_LABEL.
-
-        Parameters
-        ----------
-        question : str
-            Full CUAD question text.
-
-        Returns
-        -------
-        str | None
-            EntityLabel.value string, or None if no match found.
-
-        IMPLEMENTATION NOTES
-        --------------------
-        - Iterate QUESTION_TO_LABEL keys in order (dict is ordered in Python 3.7+)
-        - Return first match: if key.lower() in question.lower()
-        - Log at DEBUG level if no match (should not happen with correct CUAD version)
+        Convert one split (train or dev) and write DocBin to disk.
         """
-        # TODO (implementation)
-        pass
+        try:
+            import spacy
+            from spacy.tokens import DocBin
+        except ImportError:
+            raise ImportError(
+                "spaCy is required for NER conversion.\n"
+                "Install with: pip install spacy\n"
+                "Then download model: python -m spacy download en_core_web_lg"
+            )
 
-    def _chunk_context(self, context: str) -> list[tuple[int, int, str]]:
+        # Load blank English model for tokenisation
+        try:
+            nlp = spacy.load("en_core_web_lg", disable=["ner", "parser", "lemmatizer"])
+        except OSError:
+            logger.warning("en_core_web_lg not found — using blank en model")
+            nlp = spacy.blank("en")
+
+        from data_processing.span_validator import SpanValidator, Entity
+
+        # Group samples by contract title → one Doc per contract
+        contracts: dict[str, dict] = {}  # title → {context, qas}
+        for sample in samples:
+            title = sample["title"]
+            if title not in contracts:
+                contracts[title] = {"context": sample["context"], "qas": []}
+            contracts[title]["qas"].append({
+                "question": sample["question"],
+                "answers":  sample["answers"],
+            })
+
+        doc_bin        = DocBin()
+        total_entities = 0
+        total_conflicts= 0
+        label_counts: dict[str, int] = {lbl: 0 for lbl in ALL_NER_LABELS}
+        skipped_docs   = 0
+
+        for title, contract in contracts.items():
+            context = contract["context"]
+            if not context.strip():
+                skipped_docs += 1
+                continue
+
+            # Build raw entity list from all 41 QA answers
+            raw_entities: list[Entity] = []
+            for qa in contract["qas"]:
+                label    = _question_to_label(qa["question"])
+                answers  = qa["answers"]
+                texts    = answers.get("text", [])
+                starts   = answers.get("answer_start", [])
+
+                for span_text, start in zip(texts, starts):
+                    if span_text and span_text.strip():
+                        raw_entities.append(Entity(
+                            start=start,
+                            end=start + len(span_text),
+                            label=label,
+                            text=span_text,
+                        ))
+
+            # Validate spans
+            clean_entities, conflicts = SpanValidator.validate(
+                text=context,
+                entities=raw_entities,
+                doc_id=title,
+            )
+            total_conflicts += len(conflicts)
+
+            # Create spaCy Doc + set entities
+            doc = nlp.make_doc(context)
+            ents = []
+            for ent in clean_entities:
+                span = doc.char_span(ent.start, ent.end, label=ent.label)
+                if span is not None:
+                    ents.append(span)
+                    label_counts[ent.label] = label_counts.get(ent.label, 0) + 1
+                    total_entities += 1
+
+            doc.ents = ents
+            doc_bin.add(doc)
+
+        doc_bin.to_disk(output_path)
+        n_docs = len(contracts) - skipped_docs
+
+        logger.info(
+            "[%s] DocBin written — docs=%d entities=%d conflicts=%d path=%s",
+            split_name, n_docs, total_entities, total_conflicts, output_path,
+        )
+
+        return {
+            "docs":         n_docs,
+            "entities":     total_entities,
+            "conflicts":    total_conflicts,
+            "label_counts": label_counts,
+        }
+
+    # ── Standalone runner ─────────────────────────────────────────────────
+
+    @classmethod
+    def run(cls, output_dir: str | Path = "data/processed") -> dict:
         """
-        Split a long context string into overlapping chunks.
+        End-to-end: load CUAD → convert → write .spacy files.
 
-        Parameters
-        ----------
-        context : str
-            Full contract context (can be 10,000+ chars).
-
-        Returns
-        -------
-        list[tuple[int, int, str]]
-            List of (chunk_start, chunk_end, chunk_text) tuples.
-            chunk_start and chunk_end are offsets into the ORIGINAL context.
-
-        CHUNKING ALGORITHM
-        ------------------
-        1. Split context into sentences using spaCy's sentencizer
-        2. Greedily accumulate sentences until adding the next would exceed max_chunk_length
-        3. Start a new chunk at the next sentence boundary
-        4. No overlapping in Phase 1 (overlap adds complexity; revisit in Phase 2)
+        Usage
+        -----
+            python -m data_processing.cuad_to_ner
         """
-        # TODO (implementation)
-        pass
+        from data_processing.cuad_loader import CuadLoader
+        loader = CuadLoader()
+        train_samples, dev_samples = loader.load()
+
+        converter = cls()
+        return converter.convert(train_samples, dev_samples, output_dir)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+    output_dir = sys.argv[1] if len(sys.argv) > 1 else "data/processed"
+    stats = CuadToNer.run(output_dir=output_dir)
+
+    print("\n=== NER Conversion Complete ===")
+    print(f"  Train docs:       {stats['train_docs']}")
+    print(f"  Dev docs:         {stats['dev_docs']}")
+    print(f"  Total entities:   {stats['total_entities']}")
+    print(f"  Total conflicts:  {stats['total_conflicts']}")
+    print("\n  Label breakdown:")
+    for label, count in sorted(stats["label_counts"].items(), key=lambda x: -x[1]):
+        print(f"    {label:<20} {count:>6}")

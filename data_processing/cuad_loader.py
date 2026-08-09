@@ -1,195 +1,273 @@
 """
 data_processing/cuad_loader.py
 ================================
-CUAD dataset loader — wraps HuggingFace Datasets for the platform.
+CUAD dataset loader — single point of contact for loading the dataset.
 
-PURPOSE
--------
-Single point of contact for loading the CUAD dataset.
-Handles download, caching, schema inspection, and train/dev split.
-Returns plain Python dicts — no dependency on datasets library elsewhere.
+Supports two modes:
+  1. Local CUADv1.json  (primary — we already have this in data/raw/)
+  2. HuggingFace Hub   (fallback: load_dataset("theatticusproject/cuad"))
 
-THE CUAD DATASET
-----------------
-CUAD (Contract Understanding Atticus Dataset) contains:
-    - 510 commercial legal contracts
-    - 41 clause types annotated as Q&A pairs
-    - Each contract is split into overlapping context windows
-    - Each window has 41 questions with answer spans (or empty answers)
-    - Total: ~13,000 Q&A examples
+Returns plain Python dicts with a normalised schema — no dependency
+on the `datasets` library anywhere else in the codebase.
 
-HuggingFace identifier: "cuad"
-Splits available: "train" (only) — we split this into train/dev ourselves.
-
-URL: https://huggingface.co/datasets/cuad
-
-WHY WRAP datasets LIBRARY
---------------------------
-- No other module should import from `datasets` directly
-  → if we switch from HuggingFace to a local JSON format, only this file changes
-- Conversion to plain dicts here means all downstream code uses pure Python
-
-SCHEMA INSPECTION
------------------
-On first load, CuadLoader logs the dataset schema:
-    {
-        "features": ["id", "title", "context", "question", "answers"],
-        "num_rows": {"train": 22450},
-        "size_in_bytes": 128_000_000
-    }
-This helps catch schema changes in future CUAD versions.
+NORMALISED SCHEMA (one dict per QA pair)
+-----------------------------------------
+{
+  "id":            str,   # unique QA pair identifier
+  "title":         str,   # contract filename (source)
+  "context":       str,   # full contract text
+  "question":      str,   # clause-type question template
+  "answers":       dict,  # {"text": [str], "answer_start": [int]}
+                          # empty lists → clause absent in this contract
+}
 
 TRAIN / DEV SPLIT
------------------
-CUAD only provides a "train" split.
-We split deterministically using sklearn.model_selection.train_test_split:
-    - test_size = 1 - settings.cuad_train_split (default: 0.15 → 15% dev)
-    - random_state = settings.cuad_random_seed (default: 42)
-    - stratify by unique document title (ensure each contract appears in only one split)
-
-CACHING
--------
-HuggingFace caches the dataset locally after first download.
-Cache location: ~/.cache/huggingface/datasets/cuad/
-The loader checks if data/raw/ contains a local copy and uses it first.
-
-USAGE EXAMPLE
--------------
-    from data_processing.cuad_loader import CuadLoader
-
-    loader = CuadLoader()
-    train_samples, dev_samples = loader.load()
-    print(f"Train: {len(train_samples)}, Dev: {len(dev_samples)}")
-    print(train_samples[0].keys())
-    # dict_keys(['id', 'title', 'context', 'question', 'answers'])
+------------------
+Document-level split (no contract straddles train and dev):
+  - train_split = 0.85  (default) → ~18,982 rows
+  - dev_split   = 0.15  (default) → ~3,350 rows
+  - random_state = 42
 """
 
 from __future__ import annotations
 
-from core.config import get_settings
-from core.exceptions import CuadLoadError  # noqa: F401
-from core.logging import get_logger
+import json
+import logging
+import random
+from pathlib import Path
 
-log = get_logger(__name__)
+logger = logging.getLogger(__name__)
+
+# Default paths
+_DEFAULT_CUAD_JSON = (
+    Path(__file__).parent.parent
+    / "data" / "raw" / "DATA RAW" / "data" / "CUADv1.json"
+)
+
+# Split config
+TRAIN_RATIO   = 0.85
+RANDOM_SEED   = 42
 
 
-def load_cuad() -> tuple[list[dict], list[dict]]:
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level convenience
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_cuad(
+    local_path: str | Path | None = None,
+    train_ratio: float = TRAIN_RATIO,
+    random_seed: int   = RANDOM_SEED,
+) -> tuple[list[dict], list[dict]]:
     """
-    Module-level convenience function — load CUAD and return train/dev splits.
+    Load CUAD and return (train_samples, dev_samples).
 
-    This is the function exported in data_processing/__init__.py.
+    Each sample is a flat dict:
+        {id, title, context, question, answers}
 
-    Returns
-    -------
-    tuple[list[dict], list[dict]]
-        (train_samples, dev_samples)
+    Parameters
+    ----------
+    local_path : str | Path | None
+        Path to CUADv1.json. If None, uses bundled default path,
+        then falls back to HuggingFace Hub download.
+    train_ratio : float
+        Fraction of DOCUMENTS (not rows) to use for training.
+    random_seed : int
+        Random seed for deterministic split.
     """
-    # TODO: return CuadLoader().load()
-    pass
+    loader = CuadLoader(local_path=local_path, train_ratio=train_ratio,
+                        random_seed=random_seed)
+    return loader.load()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Loader class
+# ─────────────────────────────────────────────────────────────────────────────
 
 class CuadLoader:
     """
     Loads and splits the CUAD dataset.
 
-    Parameters
-    ----------
-    local_path : str | None
-        If provided, load from a local directory instead of HuggingFace Hub.
-        Useful for air-gapped environments or custom dataset versions.
-        If None, uses HuggingFace Hub with default cache.
-
-    IMPLEMENTATION NOTES
-    --------------------
-    - Use datasets.load_dataset("cuad", cache_dir=settings.data_raw_dir)
-    - Log schema on first load only (check if already logged via a class flag)
-    - Convert Dataset rows to plain dicts via dataset.to_list() or list comprehension
-    - Filter out samples with empty context (these are header-only rows in CUAD)
+    Usage
+    -----
+        loader = CuadLoader()
+        train_samples, dev_samples = loader.load()
+        print(train_samples[0].keys())
+        # dict_keys(['id', 'title', 'context', 'question', 'answers'])
     """
 
-    def __init__(self, local_path: str | None = None) -> None:
-        """
-        Initialise loader.
+    def __init__(
+        self,
+        local_path: str | Path | None = None,
+        train_ratio: float = TRAIN_RATIO,
+        random_seed: int   = RANDOM_SEED,
+    ) -> None:
+        self.local_path  = Path(local_path) if local_path else _DEFAULT_CUAD_JSON
+        self.train_ratio = train_ratio
+        self.random_seed = random_seed
+        self._schema_logged = False
 
-        Parameters
-        ----------
-        local_path : str | None
-            Optional path to local CUAD data directory.
-        """
-        # TODO (implementation): store local_path, load settings
-        pass
+    # ── Public API ────────────────────────────────────────────────────────
 
     def load(self) -> tuple[list[dict], list[dict]]:
         """
-        Load CUAD dataset and return (train_samples, dev_samples).
+        Load CUAD and return (train_samples, dev_samples).
 
-        Algorithm
-        ---------
-        1. Load dataset:
-            a. If local_path set: datasets.load_from_disk(local_path)
-            b. Else: datasets.load_dataset("cuad", cache_dir=settings.data_raw_dir)
-        2. Inspect and log schema (features, row counts, size)
-        3. Filter out samples where context is empty or < 50 chars
-        4. Split into train/dev using _split() method
-        5. Log split sizes
-        6. Return (train_list, dev_list)
+        Tries local CUADv1.json first. Falls back to HuggingFace Hub
+        if file not found.
 
         Returns
         -------
         tuple[list[dict], list[dict]]
-            Both lists contain raw CUAD sample dicts with keys:
-            ['id', 'title', 'context', 'question', 'answers']
-
-        Raises
-        ------
-        CuadLoadError
-            If dataset cannot be downloaded or parsed.
-            Includes dataset_path and split in context dict.
+            (train_samples, dev_samples) — each sample is a plain dict
         """
-        # TODO (implementation): full dataset loading logic
-        pass
+        raw_samples = self._load_from_source()
 
-    def _split(self, samples: list[dict]) -> tuple[list[dict], list[dict]]:
+        # Filter out samples with empty or very short contexts
+        filtered = [s for s in raw_samples if len(s.get("context", "")) >= 50]
+        discarded = len(raw_samples) - len(filtered)
+        if discarded:
+            logger.warning(f"Discarded {discarded} samples with context < 50 chars")
+
+        logger.info(
+            f"Loaded {len(filtered)} CUAD samples "
+            f"({len(set(s['title'] for s in filtered))} contracts)"
+        )
+
+        train, dev = self._split(filtered)
+        logger.info(f"Split → train={len(train)}  dev={len(dev)}")
+        return train, dev
+
+    def schema_info(self) -> dict:
+        """Return schema metadata for inspection / logging."""
+        train, dev = self.load()
+        sample = train[0] if train else {}
+        return {
+            "features": list(sample.keys()),
+            "num_rows":  {"train": len(train), "dev": len(dev)},
+            "total_contracts": len(set(s["title"] for s in train + dev)),
+        }
+
+    # ── Loading strategy ──────────────────────────────────────────────────
+
+    def _load_from_source(self) -> list[dict]:
+        """Load from local JSON first, then HuggingFace Hub."""
+        if self.local_path.exists():
+            logger.info(f"Loading CUAD from local file: {self.local_path}")
+            return self._load_local_json(self.local_path)
+        else:
+            logger.info("Local CUADv1.json not found — downloading from HuggingFace Hub")
+            return self._load_from_huggingface()
+
+    def _load_local_json(self, path: Path) -> list[dict]:
         """
-        Deterministically split samples into train and dev sets.
+        Load from CUADv1.json (SQuAD-style format).
 
-        Stratifies by document title to ensure no document appears
-        in both train and dev (avoids data leakage).
+        CUADv1.json structure:
+            {"data": [{"title": str, "paragraphs": [{"context": str, "qas": [...]}]}]}
 
-        Parameters
-        ----------
-        samples : list[dict]
-            All filtered CUAD samples.
-
-        Returns
-        -------
-        tuple[list[dict], list[dict]]
-            (train_samples, dev_samples)
-
-        IMPLEMENTATION NOTES
-        --------------------
-        - Extract unique titles from samples
-        - Use train_test_split(titles, test_size=1-train_split, random_state=seed)
-        - Partition samples by which split their title fell into
-        - Log: "split_complete train=N dev=M"
+        Each QA pair becomes one sample row.
         """
-        # TODO (implementation)
-        pass
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
 
-    def _log_schema(self, dataset) -> None:
+        samples: list[dict] = []
+        for entry in raw["data"]:
+            title = entry.get("title", "unknown")
+            for para in entry.get("paragraphs", []):
+                context = para.get("context", "")
+                for qa in para.get("qas", []):
+                    samples.append({
+                        "id":       qa.get("id", ""),
+                        "title":    title,
+                        "context":  context,
+                        "question": qa.get("question", ""),
+                        "answers":  {
+                            "text":         [a["text"]         for a in qa.get("answers", [])],
+                            "answer_start": [a["answer_start"] for a in qa.get("answers", [])],
+                        },
+                    })
+
+        self._log_schema_info(samples)
+        return samples
+
+    def _load_from_huggingface(self) -> list[dict]:
         """
-        Log the dataset schema for debugging and version tracking.
-
-        Parameters
-        ----------
-        dataset : datasets.DatasetDict
-            Loaded HuggingFace dataset.
-
-        Logs
-        ----
-        - Feature names and types
-        - Number of rows per split
-        - Approximate size in bytes
+        Download CUAD from HuggingFace Hub.
+        Identifier: "theatticusproject/cuad"
         """
-        # TODO (implementation)
-        pass
+        try:
+            from datasets import load_dataset  # type: ignore
+        except ImportError:
+            raise ImportError(
+                "The `datasets` library is required to download CUAD from HuggingFace.\n"
+                "Install with: pip install datasets\n"
+                f"Or place CUADv1.json at: {_DEFAULT_CUAD_JSON}"
+            )
+
+        logger.info("Downloading CUAD from HuggingFace Hub (theatticusproject/cuad)...")
+        dataset = load_dataset("theatticusproject/cuad", trust_remote_code=True)
+        train_split = dataset["train"]
+
+        # Convert to normalised dicts
+        samples: list[dict] = []
+        for row in train_split:
+            samples.append({
+                "id":       row.get("id", ""),
+                "title":    row.get("title", ""),
+                "context":  row.get("context", ""),
+                "question": row.get("question", ""),
+                "answers":  row.get("answers", {"text": [], "answer_start": []}),
+            })
+
+        self._log_schema_info(samples)
+        return samples
+
+    # ── Splitting ─────────────────────────────────────────────────────────
+
+    def _split(
+        self, samples: list[dict]
+    ) -> tuple[list[dict], list[dict]]:
+        """
+        Deterministic document-level split.
+
+        Stratifies by contract title to guarantee no contract appears
+        in both train and dev (prevents data leakage).
+
+        Algorithm:
+        1. Collect unique titles
+        2. Shuffle with fixed seed
+        3. First train_ratio → train_titles, rest → dev_titles
+        4. Partition samples by title
+        """
+        titles = sorted(set(s["title"] for s in samples))
+
+        rng = random.Random(self.random_seed)
+        rng.shuffle(titles)
+
+        n_train = max(1, int(len(titles) * self.train_ratio))
+        train_titles = set(titles[:n_train])
+        dev_titles   = set(titles[n_train:])
+
+        train = [s for s in samples if s["title"] in train_titles]
+        dev   = [s for s in samples if s["title"] in dev_titles]
+
+        logger.info(
+            f"Document split — "
+            f"train_docs={len(train_titles)}  dev_docs={len(dev_titles)}  "
+            f"train_rows={len(train)}  dev_rows={len(dev)}"
+        )
+        return train, dev
+
+    # ── Internal helpers ──────────────────────────────────────────────────
+
+    def _log_schema_info(self, samples: list[dict]) -> None:
+        if self._schema_logged or not samples:
+            return
+        sample = samples[0]
+        logger.info(
+            "CUAD schema: features=%s  total_rows=%d  contracts=%d",
+            list(sample.keys()),
+            len(samples),
+            len(set(s["title"] for s in samples)),
+        )
+        self._schema_logged = True

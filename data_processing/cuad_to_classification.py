@@ -1,193 +1,245 @@
 """
 data_processing/cuad_to_classification.py
 ==========================================
-Converts CUAD Q&A annotations into clause classification training data.
+Converts CUAD QA annotations → clause classification JSON Lines format.
 
-PURPOSE
--------
-Produces a JSON dataset where each record is a (text, label, is_present) triple.
-This format is used in Phase 2 for training a RoBERTa-legal clause classifier.
+OUTPUT FORMAT (per record, from spec §1.4)
+-------------------------------------------
+{
+  "contract_name": "N-1_4.pdf",
+  "clause_type":   "GOVERNING_LAW",
+  "text_span":     "This Agreement shall be governed by the laws of California.",
+  "label":         1
+}
 
-We build it in Phase 1 so Phase 2 can start immediately with no data-prep work.
+RULES
+-----
+- label=1  if the CUAD answer is non-empty (clause is present)
+- label=0  if answers are empty (clause is absent in this contract)
+- text_span: for label=1 → the answer text (first answer if multiple)
+             for label=0 → the full contract context (the model must predict absence)
+- clause_type: UPPER_SNAKE_CASE version of the CUAD question category
 
-OUTPUT FORMAT
--------------
-Files: data/processed/cuad_clauses_train.json
-       data/processed/cuad_clauses_dev.json
+SPLIT
+-----
+  80% train → cuad_clauses_train.json  (JSON Lines)
+  20% dev   → cuad_clauses_dev.json    (JSON Lines)
+  Split is document-level (same titles go to same split).
 
-Each file is a JSON array of ClauseSample dicts:
-[
-    {
-        "text": "The term of this Agreement shall commence on the Effective Date...",
-        "label": "RENEWAL_TERM",
-        "is_present": true,
-        "doc_id": "CUAD_v1/full_contract_pdf/N-1_4.pdf_0",
-        "meta": {
-            "question_index": 6,
-            "answer_start": 2341,
-            "char_count": 187
-        }
-    },
-    ...
-]
-
-DIFFERENCE FROM NER FORMAT
----------------------------
-NER format:  text = chunk,        entities = list of character spans
-Clause format: text = answer text OR context window, label = clause type
-
-For clause classification, we use the ANSWER TEXT directly as the positive
-example (not the full context), because:
-    - The answer IS the clause — it's the most relevant text
-    - Short, focused examples train better sequence classifiers
-    - Avoids the chunking complexity needed for NER
-
-NEGATIVE EXAMPLES
------------------
-For each clause type, 50% of training examples are negatives
-(contexts where the clause is absent, i.e., empty answers.text).
-This creates a balanced binary classifier per clause type.
-
-IMPLEMENTATION NOTES
---------------------
-- Reuse QUESTION_TO_LABEL from cuad_to_ner.py (single source of truth)
-- Write output as JSON array using json.dump with indent=2
-- Compute class balance statistics after conversion and log them
-- Include meta dict with question_index for traceability to CUAD source
-
-USAGE EXAMPLE
--------------
-    from data_processing.cuad_to_classification import CuadToClassification
-    from pathlib import Path
-
-    converter = CuadToClassification()
-    samples = converter.convert(train_samples)
-    print(samples[0].label, samples[0].is_present)
-
-    # Module-level:
-    from data_processing import build_clause_corpus
-    build_clause_corpus(train_samples, dev_samples, output_dir=Path("data/processed"))
+CLAUSE TYPE NORMALISATION
+--------------------------
+"Governing Law" → "GOVERNING_LAW"
+"IP Ownership Assignment" → "IP_OWNERSHIP_ASSIGNMENT"
+(replaces spaces/slashes/hyphens with underscore, uppercases)
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import random
+import re
 from pathlib import Path
 
-from core.exceptions import ConversionError  # noqa: F401
-from core.logging import get_logger
-from core.types import ClauseSample
+logger = logging.getLogger(__name__)
 
-log = get_logger(__name__)
+# Split ratio for this module (spec: 80/20)
+TRAIN_RATIO  = 0.80
+RANDOM_SEED  = 42
+
+# Max characters for negative (absent) text_span samples
+# We use the first N chars of the contract to give the model context
+MAX_CONTEXT_CHARS_FOR_NEGATIVE = 512
 
 
-def build_clause_corpus(
-    train_samples: list[dict],
-    dev_samples: list[dict],
-    output_dir: Path,
-) -> None:
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalise_clause_type(question: str) -> str:
     """
-    Module-level function: convert + write clause JSON files to disk.
+    Extract clause category name from a CUAD question and normalise to
+    UPPER_SNAKE_CASE for use as clause_type field.
 
-    Exported from data_processing/__init__.py.
-
-    Parameters
-    ----------
-    train_samples : list[dict]
-        Training split from CuadLoader.load()
-    dev_samples : list[dict]
-        Dev split from CuadLoader.load()
-    output_dir : Path
-        Directory where .json files will be written.
-        Files: {output_dir}/cuad_clauses_train.json, cuad_clauses_dev.json
-
-    Side Effects
-    ------------
-    - Writes two JSON files to output_dir
-    - Logs: positive count, negative count, balance ratio per label
+    Example:
+        'Highlight the parts ... "Governing Law" ...' → "GOVERNING_LAW"
+        'Highlight the parts ... "IP Ownership Assignment" ...' → "IP_OWNERSHIP_ASSIGNMENT"
     """
-    # TODO (implementation)
-    pass
+    # Extract text between first pair of double quotes
+    parts = question.split('"')
+    if len(parts) >= 3:
+        raw = parts[1].strip()
+    else:
+        raw = question[:60]
 
+    # Normalise to UPPER_SNAKE_CASE
+    # Replace spaces, hyphens, slashes, dots with underscores
+    normalised = re.sub(r"[\s\-/\.]+", "_", raw)
+    # Remove any remaining non-word characters except underscore
+    normalised = re.sub(r"[^\w]", "", normalised)
+    return normalised.upper()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main converter
+# ─────────────────────────────────────────────────────────────────────────────
 
 class CuadToClassification:
     """
-    Converts CUAD Q&A samples to clause classification training examples.
+    Converts CUAD QA samples to clause classification JSON Lines.
 
-    Implements the BaseConverter Protocol.
+    Usage
+    -----
+        converter = CuadToClassification()
+        stats = converter.convert(
+            train_samples=train,
+            dev_samples=dev,
+            output_dir="data/processed/",
+        )
 
-    Parameters
-    ----------
-    negative_ratio : float
-        Fraction of negative examples to include per clause type.
-        Default: 0.5 (equal positive/negative balance).
-    max_text_length : int
-        Maximum character length for clause text.
-        Answers longer than this are truncated with a trailing ellipsis.
+    Output files
+    ------------
+    cuad_clauses_train.json  — JSON Lines, one record per QA pair
+    cuad_clauses_dev.json    — JSON Lines, one record per QA pair
     """
 
     def __init__(
         self,
-        negative_ratio: float = 0.5,
-        max_text_length: int = 512,
+        max_context_chars: int = MAX_CONTEXT_CHARS_FOR_NEGATIVE,
     ) -> None:
-        # TODO: load settings, store params
-        pass
+        self.max_context_chars = max_context_chars
 
-    def convert(self, samples: list[dict]) -> list[ClauseSample]:
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def convert(
+        self,
+        train_samples: list[dict],
+        dev_samples:   list[dict],
+        output_dir:    str | Path = "data/processed",
+    ) -> dict:
         """
-        Convert raw CUAD dicts to ClauseSample list.
+        Convert and write both train and dev classification files.
 
-        Algorithm
-        ---------
-        1. For each sample:
-            a. Map question → label using QUESTION_TO_LABEL
-            b. If answers.text is non-empty:
-                → Create positive ClauseSample (is_present=True)
-                   text = answers.text[0] (first answer, usually the best)
-            c. If answers.text is empty:
-                → Create negative ClauseSample (is_present=False) with probability=negative_ratio
-                   text = context[:max_text_length] (partial context)
-        2. Shuffle the combined list (using cuad_random_seed for reproducibility)
-        3. Return all ClauseSamples
-
-        Parameters
-        ----------
-        samples : list[dict]
-
-        Returns
-        -------
-        list[ClauseSample]
-
-        Raises
-        ------
-        ConversionError
-            If > 5% of samples fail to convert.
+        Returns stats dict with record counts per split and per label.
         """
-        # TODO (implementation)
-        pass
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_label_set(self) -> set[str]:
-        """Return all EntityLabel values produced by this converter."""
-        # Reuse the same mapping from cuad_to_ner to avoid duplication
-        from data_processing.cuad_to_ner import QUESTION_TO_LABEL
-        return set(QUESTION_TO_LABEL.values())
+        train_records = self._samples_to_records(train_samples)
+        dev_records   = self._samples_to_records(dev_samples)
 
-    def _write_json(self, samples: list[ClauseSample], path: Path) -> None:
+        self._write_jsonl(train_records, output_dir / "cuad_clauses_train.json")
+        self._write_jsonl(dev_records,   output_dir / "cuad_clauses_dev.json")
+
+        train_pos = sum(1 for r in train_records if r["label"] == 1)
+        dev_pos   = sum(1 for r in dev_records   if r["label"] == 1)
+
+        stats = {
+            "train_records":   len(train_records),
+            "dev_records":     len(dev_records),
+            "train_positive":  train_pos,
+            "train_negative":  len(train_records) - train_pos,
+            "dev_positive":    dev_pos,
+            "dev_negative":    len(dev_records) - dev_pos,
+            "clause_types":    len(set(r["clause_type"] for r in train_records)),
+        }
+
+        logger.info(
+            "Classification conversion complete — "
+            "train=%d (pos=%d neg=%d)  dev=%d (pos=%d neg=%d)",
+            stats["train_records"], stats["train_positive"], stats["train_negative"],
+            stats["dev_records"],   stats["dev_positive"],  stats["dev_negative"],
+        )
+        return stats
+
+    # ── Internal helpers ──────────────────────────────────────────────────
+
+    def _samples_to_records(self, samples: list[dict]) -> list[dict]:
         """
-        Serialise ClauseSample list to a JSON file.
+        Convert a list of raw CUAD QA samples to classification records.
 
-        Parameters
-        ----------
-        samples : list[ClauseSample]
-        path : Path
-            Output file path (will be created/overwritten).
-
-        IMPLEMENTATION NOTES
-        --------------------
-        - Convert each ClauseSample dataclass to dict via dataclasses.asdict()
-        - Use json.dump(data, f, indent=2, ensure_ascii=False)
-        - Log: "clause_json_written path=... samples=N"
+        One record per QA pair (not per contract).
         """
-        # TODO (implementation)
-        pass
+        records: list[dict] = []
+
+        for sample in samples:
+            contract_name = sample.get("title", "unknown")
+            context       = sample.get("context", "")
+            question      = sample.get("question", "")
+            answers       = sample.get("answers", {})
+
+            clause_type = _normalise_clause_type(question)
+            texts       = answers.get("text", [])
+            is_present  = bool(texts and texts[0])
+
+            if is_present:
+                # label=1: use the first answer span as text_span
+                text_span = texts[0].strip()
+                label     = 1
+            else:
+                # label=0: use the first N chars of contract context
+                # This gives the model enough context to predict absence
+                text_span = context[: self.max_context_chars].strip()
+                label     = 0
+
+            if not text_span:
+                continue  # skip empty spans
+
+            records.append({
+                "contract_name": contract_name,
+                "clause_type":   clause_type,
+                "text_span":     text_span,
+                "label":         label,
+            })
+
+        return records
+
+    @staticmethod
+    def _write_jsonl(records: list[dict], path: Path) -> None:
+        """Write records as JSON Lines (one JSON object per line)."""
+        with open(path, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        logger.info("Written %d records → %s", len(records), path)
+
+    # ── Standalone runner ─────────────────────────────────────────────────
+
+    @classmethod
+    def run(cls, output_dir: str | Path = "data/processed") -> dict:
+        """
+        End-to-end: load CUAD → convert → write .json files.
+
+        Usage
+        -----
+            python -m data_processing.cuad_to_classification
+        """
+        from data_processing.cuad_loader import CuadLoader
+        loader = CuadLoader(train_ratio=TRAIN_RATIO)
+        train_samples, dev_samples = loader.load()
+
+        converter = cls()
+        return converter.convert(train_samples, dev_samples, output_dir)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+    output_dir = sys.argv[1] if len(sys.argv) > 1 else "data/processed"
+    stats = CuadToClassification.run(output_dir=output_dir)
+
+    print("\n=== Classification Conversion Complete ===")
+    print(f"  Train records:    {stats['train_records']:,}")
+    print(f"    Positive (1):   {stats['train_positive']:,}")
+    print(f"    Negative (0):   {stats['train_negative']:,}")
+    print(f"  Dev records:      {stats['dev_records']:,}")
+    print(f"    Positive (1):   {stats['dev_positive']:,}")
+    print(f"    Negative (0):   {stats['dev_negative']:,}")
+    print(f"  Clause types:     {stats['clause_types']}")

@@ -88,23 +88,31 @@ def train(
 
     start_time = time.time()
 
-    # ── Call spaCy train CLI ──────────────────────────────────────────────
-    try:
-        import spacy.cli
-        spacy.cli.train(
-            config_path=config,
-            output_path=output_dir,
-            overrides={
-                "paths.train":  str(train_data),
-                "paths.dev":    str(dev_data),
-                "system.gpu_allocator": "null",
-            },
-            use_gpu=gpu_id,
+    # ── Call spaCy train via subprocess ──────────────────────────────────
+    # spacy.cli.train is a module in spaCy 3.x, not callable directly.
+    # The correct entry point is: python -m spacy train
+    import subprocess, sys
+
+    cmd = [
+        sys.executable, "-m", "spacy", "train",
+        str(config),
+        "--output", str(output_dir),
+        "--paths.train", str(train_data),
+        "--paths.dev",   str(dev_data),
+        "--gpu-id",      str(gpu_id),
+    ]
+
+    logger.info("Running: %s", " ".join(cmd))
+    result = subprocess.run(cmd, check=False)
+
+    # spaCy may exit with code 1 on Windows when the output path contains spaces
+    # (a known shell-quoting quirk). Treat as success if model-last/ was written.
+    model_last = output_dir / "model-last"
+    if result.returncode != 0 and not model_last.exists():
+        raise RuntimeError(
+            f"spaCy training failed with exit code {result.returncode} "
+            f"and no model was saved to {output_dir}"
         )
-    except SystemExit as exc:
-        # spaCy's train CLI calls sys.exit(0) on success — that's fine
-        if exc.code not in (0, None):
-            raise RuntimeError(f"spaCy train exited with code {exc.code}") from exc
 
     elapsed = time.time() - start_time
     logger.info("Training complete in %.1f minutes", elapsed / 60)

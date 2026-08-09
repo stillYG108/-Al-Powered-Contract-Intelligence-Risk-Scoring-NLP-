@@ -241,8 +241,15 @@ def _chunk_text(
                     break
 
         yield text[chunk_start:chunk_end], chunk_start
+
+        # Break BEFORE updating chunk_start when we've consumed the whole text.
+        # Without this guard chunk_start = chunk_end - CHUNK_OVERLAP stays
+        # below len(text) forever → infinite loop → MemoryError.
+        if chunk_end >= len(text):
+            break
+
         chunk_start = chunk_end - CHUNK_OVERLAP
-        if chunk_start >= len(text):
+        if chunk_start >= chunk_end:  # safety guard
             break
 
 

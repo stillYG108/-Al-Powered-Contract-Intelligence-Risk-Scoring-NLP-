@@ -1,176 +1,223 @@
 """
 ner/evaluate.py
 ================
-Per-entity-type precision, recall, and F1 evaluation on the dev set.
+Evaluates the trained spaCy NER model on the dev set.
 
-PURPOSE
--------
-Provides an independent evaluation script and a programmatic API
-for computing NER metrics without running the full training pipeline.
+Prints a per-entity precision/recall/F1 table matching the spec §3.3 format:
 
-INVOCATION
-----------
+    Label               Precision  Recall     F1      Support
+    ──────────────────────────────────────────────────────────
+    ORG                   0.912     0.887    0.899      412
+    LAW_JURISDICTION      0.871     0.903    0.887      284
+    DATE                  0.834     0.761    0.796      201
+    MONEY                 0.798     0.743    0.770      156
+    DURATION              0.756     0.701    0.728       89
+    ──────────────────────────────────────────────────────────
+    MICRO AVG             0.856     0.831    0.843     3421
+
+USAGE
+-----
+    python -m ner.evaluate
     python -m ner.evaluate --model models/ner_baseline --dev data/processed/cuad_ner_dev.spacy
-
-METRICS COMPUTED
-----------------
-For each entity label:
-    Precision  = TP / (TP + FP)   — "of all predicted spans, how many were correct?"
-    Recall     = TP / (TP + FN)   — "of all gold spans, how many were found?"
-    F1         = 2 × P × R / (P + R)  — harmonic mean
-
-Overall (micro and macro):
-    Micro F1   = F1 computed on pooled TP/FP/FN counts (favours frequent labels)
-    Macro F1   = mean of per-label F1 scores (treats all labels equally)
-
-SPAN MATCHING STRATEGY
------------------------
-Exact match: a predicted span is correct only if BOTH start AND end
-character offsets AND label match the gold annotation exactly.
-
-Rationale: CUAD annotations are precise; partial credit creates ambiguity
-and makes comparison across models harder. Partial match can be added
-in Phase 2 if needed.
-
-OUTPUT FORMAT
--------------
-Prints to stdout:
-    ══════════════════════════════════════════════════════
-     NER Evaluation — models/ner_baseline
-     Dev set: data/processed/cuad_ner_dev.spacy (1477 samples)
-    ══════════════════════════════════════════════════════
-     Label                          P       R      F1   Support
-    ──────────────────────────────────────────────────────────
-     PARTIES                     0.912   0.887   0.899     412
-     GOVERNING_LAW               0.871   0.903   0.887     284
-     EXPIRATION_DATE              0.834   0.761   0.796     201
-     ...
-    ──────────────────────────────────────────────────────────
-     MICRO AVG                   0.856   0.831   0.843    3421
-     MACRO AVG                   0.841   0.818   0.829      —
-    ══════════════════════════════════════════════════════
-
-Also writes metrics to JSON: models/ner_baseline/eval_metrics.json
-
-INTEGRATION WITH TRAINING
---------------------------
-train.py calls compute_metrics() in _post_training_steps().
-The return value (dict) is stored in training_meta.json.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import sys
+from collections import defaultdict
 from pathlib import Path
 
-from core.logging import get_logger, configure_logging
-from core.types import Entity
+logger = logging.getLogger(__name__)
 
-log = get_logger(__name__)
+ROOT      = Path(__file__).parent.parent
+MODEL_DIR = ROOT / "models" / "ner_baseline" / "model-best"
+DEV_DATA  = ROOT / "data" / "processed" / "cuad_ner_dev.spacy"
 
 
-def compute_metrics(
-    model_path: Path,
-    dev_path: Path,
+def evaluate(
+    model_path: Path = MODEL_DIR,
+    dev_data:   Path = DEV_DATA,
+    output_json: Path | None = None,
 ) -> dict:
     """
-    Compute per-label P/R/F1 metrics and overall micro/macro averages.
+    Evaluate the NER model on the dev DocBin.
 
     Parameters
     ----------
     model_path : Path
-        Path to the saved spaCy model directory.
-    dev_path : Path
-        Path to the cuad_ner_dev.spacy DocBin file.
+        Path to the saved spaCy model directory (model-best/).
+    dev_data : Path
+        Path to cuad_ner_dev.spacy (DocBin).
+    output_json : Path | None
+        If set, writes evaluation results to this JSON file.
 
     Returns
     -------
     dict
         {
-            "per_label": {
-                "PARTIES": {"precision": 0.912, "recall": 0.887, "f1": 0.899, "support": 412},
-                ...
-            },
-            "micro": {"precision": 0.856, "recall": 0.831, "f1": 0.843},
-            "macro": {"precision": 0.841, "recall": 0.818, "f1": 0.829},
-            "total_samples": 1477,
-            "total_entities": 3421,
+          "micro_f1": float,
+          "micro_precision": float,
+          "micro_recall": float,
+          "per_label": {label: {"precision", "recall", "f1", "support"}},
+        }
+    """
+    import spacy
+    from spacy.tokens import DocBin
+    from spacy.scorer import Scorer
+
+    # ── Load model ────────────────────────────────────────────────────────
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Model not found: {model_path}\n"
+            f"Run: python -m ner.train"
+        )
+    if not dev_data.exists():
+        raise FileNotFoundError(
+            f"Dev data not found: {dev_data}\n"
+            f"Run: python data_processing/run_task1.py"
+        )
+
+    logger.info("Loading model from %s", model_path)
+    nlp = spacy.load(str(model_path))
+
+    logger.info("Loading dev set from %s", dev_data)
+    doc_bin  = DocBin().from_disk(dev_data)
+    dev_docs = list(doc_bin.get_docs(nlp.vocab))
+
+    logger.info("Evaluating on %d documents...", len(dev_docs))
+
+    # ── Compute predictions and scores ─────────────────────────────────────
+    # Per-label accumulators: {label → (tp, fp, fn)}
+    label_stats: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"tp": 0, "fp": 0, "fn": 0}
+    )
+
+    for gold_doc in dev_docs:
+        # Run model on the raw text
+        pred_doc = nlp(gold_doc.text)
+
+        gold_spans = {(e.start_char, e.end_char, e.label_) for e in gold_doc.ents}
+        pred_spans = {(e.start_char, e.end_char, e.label_) for e in pred_doc.ents}
+
+        for span in pred_spans:
+            label = span[2]
+            if span in gold_spans:
+                label_stats[label]["tp"] += 1
+            else:
+                label_stats[label]["fp"] += 1
+
+        for span in gold_spans:
+            label = span[2]
+            if span not in pred_spans:
+                label_stats[label]["fn"] += 1
+
+    # ── Compute metrics ────────────────────────────────────────────────────
+    per_label: dict[str, dict] = {}
+    total_tp = total_fp = total_fn = 0
+
+    for label, counts in sorted(label_stats.items()):
+        tp = counts["tp"]
+        fp = counts["fp"]
+        fn = counts["fn"]
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1        = (
+            2 * precision * recall / (precision + recall)
+            if (precision + recall) > 0 else 0.0
+        )
+        support = tp + fn  # all gold occurrences
+
+        per_label[label] = {
+            "precision": round(precision, 4),
+            "recall":    round(recall,    4),
+            "f1":        round(f1,        4),
+            "support":   support,
         }
 
-    ALGORITHM
-    ---------
-    1. Load model: spacy.load(model_path)
-    2. Load dev DocBin → list of gold Doc objects
-    3. For each gold Doc:
-        a. Run nlp(doc.text) → predicted Doc
-        b. Compare pred.ents vs gold doc.ents
-        c. Accumulate TP, FP, FN per label
-    4. Compute P/R/F1 per label from accumulated counts
-    5. Compute micro and macro averages
-    6. Return metrics dict
+        total_tp += tp
+        total_fp += fp
+        total_fn += fn
 
-    SPAN COMPARISON
-    ---------------
-    Use frozenset of (start, end, label) tuples for O(1) lookup:
-        gold_spans = {(e.start_char, e.end_char, e.label_) for e in doc.ents}
-        pred_spans = {(e.start_char, e.end_char, e.label_) for e in pred.ents}
-        tp = gold_spans & pred_spans
-        fp = pred_spans - gold_spans
-        fn = gold_spans - pred_spans
+    # Micro averages
+    micro_p = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    micro_r = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    micro_f = (
+        2 * micro_p * micro_r / (micro_p + micro_r)
+        if (micro_p + micro_r) > 0 else 0.0
+    )
 
-    Raises
-    ------
-    ModelNotFoundError
-        If model_path does not exist.
-    FileNotFoundError
-        If dev_path does not exist.
-    """
-    # TODO (implementation)
-    pass
+    results = {
+        "micro_precision": round(micro_p, 4),
+        "micro_recall":    round(micro_r, 4),
+        "micro_f1":        round(micro_f, 4),
+        "total_support":   total_tp + total_fn,
+        "per_label":       per_label,
+    }
 
+    # ── Print table ────────────────────────────────────────────────────────
+    _print_table(per_label, micro_p, micro_r, micro_f, total_tp + total_fn)
 
-def print_metrics_table(metrics: dict, model_path: str = "") -> None:
-    """
-    Print the evaluation metrics as a formatted ASCII table.
+    # ── Optionally write JSON ─────────────────────────────────────────────
+    if output_json:
+        with open(output_json, "w") as f:
+            json.dump(results, f, indent=2)
+        logger.info("Evaluation results written to %s", output_json)
 
-    Parameters
-    ----------
-    metrics : dict
-        Output of compute_metrics().
-    model_path : str
-        Model path string to display in the header.
-
-    IMPLEMENTATION NOTES
-    --------------------
-    - Sort labels by F1 descending
-    - Right-align numeric columns
-    - Print separator lines with ─ and ═ characters
-    - Highlight labels with F1 < 0.5 with a "⚠" prefix (low quality signal)
-    """
-    # TODO (implementation)
-    pass
+    return results
 
 
-def save_metrics(metrics: dict, output_path: Path) -> None:
-    """
-    Save metrics dict to a JSON file.
+def _print_table(
+    per_label: dict[str, dict],
+    micro_p: float,
+    micro_r: float,
+    micro_f: float,
+    total_support: int,
+) -> None:
+    """Print the spec-format evaluation table."""
+    sep = "─" * 58
+    header = f"{'Label':<22}  {'Precision':>9}  {'Recall':>6}  {'F1':>6}  {'Support':>7}"
+    print()
+    print(header)
+    print(sep)
 
-    Parameters
-    ----------
-    metrics : dict
-        Output of compute_metrics().
-    output_path : Path
-        Path to write eval_metrics.json.
-    """
-    # TODO: json.dump(metrics, output_path.open("w"), indent=2)
-    pass
+    # Sort by F1 descending
+    for label, m in sorted(per_label.items(), key=lambda x: -x[1]["f1"]):
+        print(
+            f"{label:<22}  {m['precision']:>9.3f}  {m['recall']:>6.3f}"
+            f"  {m['f1']:>6.3f}  {m['support']:>7}"
+        )
+
+    print(sep)
+    print(
+        f"{'MICRO AVG':<22}  {micro_p:>9.3f}  {micro_r:>6.3f}"
+        f"  {micro_f:>6.3f}  {total_support:>7}"
+    )
+    print()
 
 
-def main() -> None:
-    """CLI entry-point: parse args, run evaluate, print and save results."""
-    configure_logging()
-    # TODO: argparse for --model and --dev flags
-    pass
-
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    sys.path.insert(0, str(ROOT))
+
+    parser = argparse.ArgumentParser(description="Evaluate CUAD NER model")
+    parser.add_argument("--model",  default=str(MODEL_DIR),
+                        help="Path to model-best/ directory")
+    parser.add_argument("--dev",    default=str(DEV_DATA),
+                        help="Path to cuad_ner_dev.spacy")
+    parser.add_argument("--output", default=None,
+                        help="Optional path to write JSON results")
+    args = parser.parse_args()
+
+    evaluate(
+        model_path=Path(args.model),
+        dev_data=Path(args.dev),
+        output_json=Path(args.output) if args.output else None,
+    )

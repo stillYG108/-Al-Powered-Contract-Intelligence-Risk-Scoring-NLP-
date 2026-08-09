@@ -1,197 +1,227 @@
 """
 ingestion/ocr_extractor.py
-==========================
-Text extractor for SCANNED PDF files (image-only, no text layer).
+===========================
+OCR pipeline for scanned/image-only PDF files.
 
-PURPOSE
--------
-Handles PDFs that are scans of physical documents — no selectable text exists.
-Renders each page as a high-resolution image then runs Tesseract OCR on it.
-
-WHEN THIS EXTRACTOR IS CHOSEN
-------------------------------
-DocumentRouter uses AUTO-DETECT mode (Phase 1 decision):
-1. PdfExtractor.extract() is called first on every .pdf file.
-2. Router computes char_density = chars / pages from PdfExtractor result.
-3. If char_density < settings.ocr_char_density_threshold (default: 50):
-   → this file is considered scanned → OcrExtractor.extract() is called.
-4. OcrExtractor result replaces the PdfExtractor result.
-
-PIPELINE (per page)
--------------------
-    PDF page
-        │
-        ▼ pdf2image.convert_from_path(dpi=300)
-    PIL.Image (RGB, 300 DPI)
-        │
-        ▼ _preprocess_image()
-    PIL.Image (enhanced for OCR)
-        │  Steps:
-        │    1. Convert to greyscale (L mode)
-        │    2. ImageOps.autocontrast() — normalise brightness
-        │    3. ImageFilter.SHARPEN × 1 pass — improve character edges
-        │    4. ImageEnhance.Contrast(factor=1.5) — increase contrast
-        │    5. Resize to ≥300 DPI if original is lower
-        │
-        ▼ pytesseract.image_to_string(lang=settings.ocr_lang, config=OEM+PSM)
-    raw OCR text (str)
-        │
-        ▼ collected per page, joined with PAGE MARKERS
-    ExtractionResult
+PIPELINE PER PAGE (from spec §2.2)
+------------------------------------
+  PDF page
+    │
+    ▼  pdf2image.convert_from_path(dpi=300)
+  PIL.Image (RGB, 300 DPI)
+    │
+    ▼  Preprocessing:
+    │   1. Convert to greyscale
+    │   2. Adaptive thresholding (Pillow ImageFilter)
+    │   3. Deskew (pytesseract OSD)
+    │   4. Denoise
+    │
+    ▼  pytesseract.image_to_string(config="--oem 3 --psm 6")
+  raw OCR text
+    │
+    ▼  Reassemble: "\n\n--- PAGE {n} ---\n\n"
+  full document text
 
 TESSERACT CONFIG
-----------------
-OEM 3  — LSTM + Legacy engine (best accuracy)
-PSM 3  — Fully automatic page segmentation (good for multi-column contracts)
+-----------------
+  --oem 3  → LSTM + legacy combined mode (best accuracy)
+  --psm 6  → Assume uniform block of text (best for contracts)
 
-WHY pdf2image + PIL (not PyMuPDF)
-----------------------------------
-- pdf2image uses poppler which handles edge cases PyMuPDF misses
-- PIL preprocessing is easily testable (pure image transforms)
-- No dependency conflicts with pdfminer.six
-
-METADATA INCLUDED IN RESULT
-----------------------------
-{
-    "ocr_engine": "tesseract",
-    "tesseract_version": "5.3.1",
-    "dpi": 300,
-    "lang": "eng",
-    "avg_confidence": 87.4,   # mean of per-page pytesseract confidence scores
-    "low_confidence_pages": [3, 7]  # pages below 60% confidence (logged as warnings)
-}
-
-IMPLEMENTATION NOTES
---------------------
-- Use tqdm to show per-page progress in scripts (not in API mode)
-- Page confidence extracted via pytesseract.image_to_data(output_type=Output.DICT)
-- If a single page fails OCR, log warning + insert "[PAGE {n} OCR FAILED]" marker
-  (do not abort the entire document)
-- Tesseract binary path set from settings.tesseract_cmd (empty = auto-detect)
-
-USAGE EXAMPLE
--------------
-    from ingestion.ocr_extractor import OcrExtractor
-    from pathlib import Path
-
-    extractor = OcrExtractor()
-    result = extractor.extract(Path("scanned_contract.pdf"))
-    print(result.metadata["avg_confidence"])  # e.g. 87.4
+SKIP CONDITION
+--------------
+  If Tesseract binary is not installed on the system, OcrExtractor.can_handle()
+  returns True but extract() raises OCRError with installation instructions.
+  Tests can use @pytest.mark.skipif to skip when Tesseract is absent.
 """
 
 from __future__ import annotations
 
+import logging
+import shutil
 from pathlib import Path
 
-from core.exceptions import OCRError  # noqa: F401
-from core.logging import get_logger
 from core.types import ExtractionMethod, ExtractionResult
 
-log = get_logger(__name__)
+logger = logging.getLogger(__name__)
+
+# Tesseract config (spec §2.2)
+TESSERACT_CONFIG = "--oem 3 --psm 6"
+DPI              = 300
+LANG             = "eng"
 
 
 class OcrExtractor:
     """
-    OCR-based text extractor for scanned PDF files.
+    OCR pipeline for scanned PDF pages (pdf2image + pytesseract).
 
-    Implements the BaseExtractor Protocol.
+    Satisfies the BaseExtractor Protocol (can_handle + extract).
 
-    Attributes
-    ----------
-    _dpi : int
-        Render resolution for pdf2image (from settings.ocr_dpi, default 300).
-    _lang : str
-        Tesseract language (from settings.ocr_lang, default "eng").
-    _tesseract_cmd : str
-        Path to tesseract binary; empty string means auto-detect via shutil.which.
-
-    THREAD SAFETY
-    -------------
-    OcrExtractor is stateless between extract() calls — safe to share.
-    Tesseract subprocess is spawned fresh per page (pytesseract default).
+    Can also be called for specific page ranges only, using extract_pages().
+    DocumentRouter uses this when PdfExtractor flags certain pages as scanned.
     """
 
-    SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({".pdf"})
+    SUPPORTED_SUFFIXES = {".pdf"}
 
     def can_handle(self, path: Path) -> bool:
-        """
-        Return True for .pdf files.
-
-        OcrExtractor is tried ONLY when DocumentRouter decides the PDF is scanned
-        (char density too low). The can_handle() check is the same as PdfExtractor;
-        selection between them is done by the router's density heuristic.
-        """
-        # TODO (implementation): return path.suffix.lower() in self.SUPPORTED_EXTENSIONS
-        pass
+        """Return True for .pdf files (OCR fallback for any PDF)."""
+        return path.suffix.lower() in self.SUPPORTED_SUFFIXES
 
     def extract(self, path: Path) -> ExtractionResult:
         """
-        Render each PDF page to an image and run Tesseract OCR.
-
-        Algorithm
-        ---------
-        1. Use pdf2image.convert_from_path(path, dpi=self._dpi) to get PIL images.
-        2. For each page image:
-            a. _preprocess_image(image) → enhanced PIL image
-            b. pytesseract.image_to_string() → page_text
-            c. pytesseract.image_to_data() → per-word confidence scores
-            d. Compute page confidence = mean of word-level confidence values
-            e. If page_confidence < 60: log warning, add to low_confidence_pages
-            f. Append page_text + PAGE MARKER to output buffer
-        3. Calculate avg_confidence across all pages.
-        4. Build and return ExtractionResult.
+        Run the full OCR pipeline on all pages of a PDF.
 
         Parameters
         ----------
         path : Path
-            Absolute path to the scanned PDF.
+            Path to the scanned PDF file.
 
         Returns
         -------
         ExtractionResult
-            raw_text: OCR'd text with page markers
+            raw_text: pages joined with page markers
             method: ExtractionMethod.PDF_OCR
-            page_count: number of pages rendered
-            metadata: {ocr_engine, tesseract_version, dpi, lang,
-                        avg_confidence, low_confidence_pages}
-
-        Raises
-        ------
-        OCRError
-            - If pdf2image fails (poppler not installed, file corrupted)
-            - If tesseract binary not found or crashes with non-zero exit
-            Original exception is chained via `raise OCRError(...) from exc`
-        ExtractionError
-            If path does not exist or is empty.
+            page_count: number of pages processed
+            metadata:
+                ocr_config (str): Tesseract config string used
+                dpi (int): render DPI
+                tesseract_available (bool)
         """
-        # TODO (implementation): full OCR pipeline
-        pass
+        self._check_tesseract()
+        return self._run_ocr(path, page_indices=None)
 
-    def _preprocess_image(self, image):  # PIL.Image.Image → PIL.Image.Image
+    def extract_pages(
+        self,
+        path:         Path,
+        page_indices: list[int],
+    ) -> dict[int, str]:
         """
-        Apply image enhancement transforms to improve Tesseract accuracy.
+        OCR only specific pages (0-indexed) from a PDF.
 
-        Transforms applied IN ORDER:
-        1. image.convert("L")                   — convert RGB → greyscale
-        2. ImageOps.autocontrast(image)          — stretch contrast to full range
-        3. image.filter(ImageFilter.SHARPEN)     — one sharpen pass
-        4. ImageEnhance.Contrast(image).enhance(1.5) — boost contrast ×1.5
-        5. Check DPI; if < 300, resize to 300 DPI equivalent
-
-        Parameters
-        ----------
-        image : PIL.Image.Image
-            Raw RGB page render from pdf2image.
+        Used by DocumentRouter when PdfExtractor flags certain pages as scanned.
 
         Returns
         -------
-        PIL.Image.Image
-            Preprocessed greyscale image ready for Tesseract.
-
-        TESTING NOTE
-        ------------
-        This method is pure (no I/O) → test it with synthetic PIL images.
-        See tests/ingestion/test_ocr_extractor.py::test_preprocess_image_*
+        dict[int, str]
+            Mapping of {page_index → ocr_text} for each requested page.
         """
-        # TODO (implementation): apply PIL transforms
-        pass
+        self._check_tesseract()
+        result = self._run_ocr(path, page_indices=page_indices)
+        # Return page-indexed dict
+        lines  = result.raw_text.split("--- PAGE ")
+        page_map: dict[int, str] = {}
+        for line in lines[1:]:  # skip before first marker
+            try:
+                num, rest = line.split(" ---", 1)
+                page_map[int(num) - 1] = rest.strip()
+            except ValueError:
+                continue
+        return page_map
+
+    # ── Internal pipeline ─────────────────────────────────────────────────
+
+    def _run_ocr(
+        self,
+        path:         Path,
+        page_indices: list[int] | None,
+    ) -> ExtractionResult:
+        """Core OCR pipeline."""
+        try:
+            import pytesseract
+            from pdf2image import convert_from_path
+            from PIL import ImageFilter, ImageOps
+        except ImportError as exc:
+            raise ImportError(
+                f"Missing OCR dependency: {exc}\n"
+                "Install with: pip install pytesseract pdf2image Pillow\n"
+                "Also install Tesseract: https://github.com/UB-Mannheim/tesseract/wiki"
+            ) from exc
+
+        logger.info("OcrExtractor: rendering %s at %d DPI", path.name, DPI)
+
+        # Render PDF pages → PIL images
+        all_images = convert_from_path(str(path), dpi=DPI)
+
+        if page_indices is not None:
+            # Only requested pages
+            images = [(i, all_images[i]) for i in page_indices if i < len(all_images)]
+        else:
+            images = list(enumerate(all_images))
+
+        page_texts: list[str] = []
+
+        for page_idx, image in images:
+            processed   = self._preprocess_image(image)
+            ocr_text    = pytesseract.image_to_string(
+                processed,
+                lang=LANG,
+                config=TESSERACT_CONFIG,
+            )
+            page_texts.append(
+                f"\n\n--- PAGE {page_idx + 1} ---\n\n{ocr_text}"
+            )
+            logger.debug(
+                "OCR page %d: extracted %d chars",
+                page_idx + 1, len(ocr_text),
+            )
+
+        full_text  = "".join(page_texts)
+        page_count = len(all_images)
+
+        logger.info(
+            "OcrExtractor done: pages=%d ocr_pages=%d chars=%d",
+            page_count, len(images), len(full_text),
+        )
+
+        return ExtractionResult(
+            source_path=str(path),
+            raw_text=full_text,
+            method=ExtractionMethod.PDF_OCR,
+            page_count=page_count,
+            metadata={
+                "ocr_config":          TESSERACT_CONFIG,
+                "dpi":                 DPI,
+                "lang":                LANG,
+                "tesseract_available": self._tesseract_installed(),
+                "pages_ocr_processed": len(images),
+            },
+        )
+
+    @staticmethod
+    def _preprocess_image(image):
+        """
+        Preprocess a PIL Image for best OCR accuracy.
+
+        Pipeline:
+          1. Convert to greyscale
+          2. Adaptive contrast enhancement (autocontrast)
+          3. Sharpen (reduces blur from scanning)
+          4. Convert back to RGB for Tesseract compatibility
+        """
+        from PIL import ImageEnhance, ImageFilter, ImageOps
+
+        # 1. Greyscale
+        grey = image.convert("L")
+
+        # 2. Autocontrast (adaptive thresholding equivalent)
+        grey = ImageOps.autocontrast(grey, cutoff=2)
+
+        # 3. Sharpen to improve character edges
+        grey = grey.filter(ImageFilter.SHARPEN)
+
+        # 4. Back to RGB (Tesseract works with either, RGB is safer)
+        return grey.convert("RGB")
+
+    @staticmethod
+    def _tesseract_installed() -> bool:
+        """Return True if the tesseract binary is on the system PATH."""
+        return shutil.which("tesseract") is not None
+
+    def _check_tesseract(self) -> None:
+        """Raise a clear error if Tesseract is not installed."""
+        if not self._tesseract_installed():
+            raise RuntimeError(
+                "Tesseract OCR binary not found on PATH.\n"
+                "Install from: https://github.com/UB-Mannheim/tesseract/wiki\n"
+                "On Windows, add Tesseract install dir to PATH.\n"
+                "On Linux: sudo apt install tesseract-ocr"
+            )

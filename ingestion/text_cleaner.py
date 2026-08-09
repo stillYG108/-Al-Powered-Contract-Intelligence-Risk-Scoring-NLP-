@@ -1,239 +1,284 @@
 """
 ingestion/text_cleaner.py
 ==========================
-Post-extraction text normalisation — pure functions only.
+Post-extraction normalisation — runs after any extractor.
 
-PURPOSE
--------
-Cleans raw extracted text BEFORE it reaches the NER model or training pipeline.
-Every function here is a pure transformation: str → str (no I/O, no state).
+CLEANING STEPS (from spec §2.5)
+---------------------------------
+1. Ligature fix       — ﬁ→fi, ﬂ→fl, ﬃ→ffi, ﬀ→ff, ﬄ→ffl, etc.
+2. Whitespace         — collapse multiple blank lines, trim line-trailing spaces
+3. Header/footer removal — heuristic: short lines (< 60 chars) that appear
+                           on 3+ pages are treated as running headers/footers
+4. Encoding artefacts — replace common mojibake sequences
+5. Metadata returned  — {pages, word_count, extraction_method}
 
-WHY A SEPARATE MODULE
----------------------
-Extraction and cleaning are different responsibilities:
-    Extractor  → "get all the characters out of the file"
-    TextCleaner → "make those characters clean and consistent"
-
-Keeping them separate means:
-    - Cleaners are trivially unit-testable with string inputs
-    - The same cleaner runs on OCR output, PDF output, DOCX output, API input
-    - Cleaning rules can be tuned without touching any extractor
-
-CLEANING PIPELINE (applied in order by TextCleaner.clean())
-------------------------------------------------------------
-    1. fix_ligatures(text)
-       Replaces Unicode ligatures with ASCII equivalents:
-           ﬁ → fi,  ﬂ → fl,  ﬃ → ffi,  ﬄ → ffl,  ﬀ → ff,  ﬅ → st
-
-    2. fix_encoding_artifacts(text)
-       Removes or replaces common encoding artefacts:
-           \x00 (null bytes) → ""
-           \ufffd (replacement char) → ""
-           \u00ad (soft hyphen) → ""
-           Windows-1252 mojibake patterns (e.g., â€™ → ')
-
-    3. normalise_whitespace(text)
-       - Collapse 3+ consecutive newlines → exactly 2 newlines
-       - Collapse 2+ consecutive spaces → single space
-       - Strip leading/trailing whitespace from each line
-       - Strip leading/trailing whitespace from the full text
-
-    4. remove_page_markers(text)             [OPTIONAL — disabled by default]
-       Strips "--- PAGE {n} ---" markers inserted by PDF/OCR extractors.
-       Pass remove_markers=True to enable (e.g., for NER input).
-       Keep markers disabled (default) for audit/debugging output.
-
-    5. normalise_hyphens(text)
-       - Replaces en-dash (–) and em-dash (—) with hyphen-minus (-)
-         when used as word connectors (not when used as list bullets)
-       - Rejoins hyphenated line-breaks: "agree-\nment" → "agreement"
-         (common in PDF and OCR output from justified text)
-
-USAGE EXAMPLE
--------------
-    from ingestion.text_cleaner import TextCleaner
-
-    # Full pipeline:
-    clean = TextCleaner.clean(raw_text)
-
-    # Individual steps:
-    text = TextCleaner.fix_ligatures(text)
-    text = TextCleaner.normalise_whitespace(text)
-
-    # With page marker removal:
-    clean = TextCleaner.clean(raw_text, remove_markers=True)
-
-TESTING
--------
-All methods are pure functions → test with:
-    assert TextCleaner.fix_ligatures("ﬁle") == "file"
-    assert TextCleaner.normalise_whitespace("a   b") == "a b"
-See tests/ingestion/test_text_cleaner.py for full suite.
+DESIGN
+------
+- Stateless: TextCleaner.clean() is a pure function
+- Non-destructive for legal text: does NOT lowercase, does NOT remove
+  punctuation (amounts, dates, section refs must be preserved exactly)
 """
 
 from __future__ import annotations
 
+import logging
 import re
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+
+from core.types import ExtractionResult
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ligature table  (Unicode typographic ligatures → ASCII equivalents)
+# ─────────────────────────────────────────────────────────────────────────────
+
+LIGATURE_MAP: dict[str, str] = {
+    "\ufb00": "ff",   # ﬀ
+    "\ufb01": "fi",   # ﬁ
+    "\ufb02": "fl",   # ﬂ
+    "\ufb03": "ffi",  # ﬃ
+    "\ufb04": "ffl",  # ﬄ
+    "\ufb05": "st",   # ﬅ (long-s t)
+    "\ufb06": "st",   # ﬆ
+    "\u00e6": "ae",   # æ  (common in older legal text)
+    "\u0153": "oe",   # œ
+    "\u2019": "'",    # right single quotation mark → apostrophe
+    "\u2018": "'",    # left single quotation mark
+    "\u201c": '"',    # left double quotation mark
+    "\u201d": '"',    # right double quotation mark
+    "\u2013": "-",    # en dash
+    "\u2014": "--",   # em dash
+    "\u2026": "...",  # ellipsis
+    "\u00a0": " ",    # non-breaking space
+    "\u200b": "",     # zero-width space
+}
+
+# Header/footer heuristics
+MAX_HEADER_FOOTER_LEN:  int = 60   # lines shorter than this are candidates
+MIN_PAGES_FOR_PATTERN:  int = 3    # must appear on at least this many pages
+MIN_PAGES_TO_USE_HEURISTIC: int = 4  # don't bother on very short docs
+
+
+@dataclass
+class CleanResult:
+    """Result of a TextCleaner.clean() call."""
+    text:               str
+    word_count:         int
+    char_count:         int
+    ligatures_replaced: int
+    lines_removed:      int        # header/footer lines removed
+    extraction_method:  str        # from ExtractionResult.method
 
 
 class TextCleaner:
     """
-    Namespace class providing static text normalisation methods.
+    Post-extraction text normalisation.
 
-    All methods are @staticmethod — TextCleaner is never instantiated.
-    This makes the calling convention clean: TextCleaner.clean(text)
-    without needing to manage object state.
+    All methods are @staticmethod — no instantiation needed.
+
+    Usage
+    -----
+        cleaned = TextCleaner.clean(extraction_result)
+        print(cleaned.text[:300])
     """
 
-    # Ligature → ASCII mapping
-    _LIGATURE_MAP: dict[str, str] = {
-        "\ufb01": "fi",    # ﬁ
-        "\ufb02": "fl",    # ﬂ
-        "\ufb03": "ffi",   # ﬃ
-        "\ufb04": "ffl",   # ﬄ
-        "\ufb00": "ff",    # ﬀ
-        "\ufb05": "st",    # ﬅ
-        "\ufb06": "st",    # ﬆ
-    }
-
-    # Regex: PAGE MARKER pattern inserted by extractors
-    _PAGE_MARKER_RE: re.Pattern = re.compile(
-        r"\n\n---\s*PAGE\s+\d+\s*---\n\n", re.IGNORECASE
-    )
-
-    # Regex: hyphenated line break (word split across lines)
-    _HYPHEN_LINEBREAK_RE: re.Pattern = re.compile(r"(\w+)-\n(\w+)")
-
     @staticmethod
-    def clean(text: str, *, remove_markers: bool = False) -> str:
+    def clean(result: ExtractionResult) -> CleanResult:
         """
-        Run the full cleaning pipeline on `text`.
-
-        Steps applied in order:
-            1. fix_ligatures
-            2. fix_encoding_artifacts
-            3. normalise_hyphens
-            4. normalise_whitespace
-            5. remove_page_markers (if remove_markers=True)
-
-        Parameters
-        ----------
-        text : str
-            Raw extracted text from any extractor.
-        remove_markers : bool
-            If True, strip "--- PAGE n ---" markers (for NER input).
-            If False (default), preserve them (for audit output).
-
-        Returns
-        -------
-        str
-            Cleaned, normalised text.
-        """
-        # TODO (implementation): chain all steps
-        pass
-
-    @staticmethod
-    def fix_ligatures(text: str) -> str:
-        """
-        Replace Unicode ligature characters with ASCII equivalents.
-
-        Parameters
-        ----------
-        text : str
-
-        Returns
-        -------
-        str
-            Text with all ligatures expanded.
-
-        EXAMPLE
-        -------
-            "ﬁnancial ﬂow" → "financial flow"
-        """
-        # TODO: return text.translate(str.maketrans(TextCleaner._LIGATURE_MAP))
-        pass
-
-    @staticmethod
-    def fix_encoding_artifacts(text: str) -> str:
-        """
-        Remove or replace known encoding artefacts.
-
-        Artefacts handled:
-            - Null bytes (\\x00) → ""
-            - Unicode replacement char (\\ufffd) → ""
-            - Soft hyphens (\\u00ad) → ""
-            - Common Windows-1252 mojibake sequences
-
-        Parameters
-        ----------
-        text : str
-
-        Returns
-        -------
-        str
-        """
-        # TODO (implementation)
-        pass
-
-    @staticmethod
-    def normalise_whitespace(text: str) -> str:
-        """
-        Collapse excess whitespace while preserving paragraph breaks.
-
-        Rules:
-            - 3+ consecutive newlines → exactly 2 newlines (one blank line)
-            - 2+ consecutive spaces → single space (inside lines)
-            - Strip leading/trailing whitespace from each line
-            - Strip leading/trailing whitespace from full text
-
-        Parameters
-        ----------
-        text : str
-
-        Returns
-        -------
-        str
-        """
-        # TODO (implementation)
-        pass
-
-    @staticmethod
-    def normalise_hyphens(text: str) -> str:
-        """
-        Normalise various hyphen/dash characters and rejoin line-break hyphens.
+        Run the full cleaning pipeline on an ExtractionResult.
 
         Steps:
-            1. Replace en-dash (–) and em-dash (—) with hyphen-minus (-)
-               ONLY when surrounded by word characters (not as list bullets).
-            2. Rejoin hyphenated line breaks: "agree-\\nment" → "agreement"
-               Uses _HYPHEN_LINEBREAK_RE pattern.
+          1. Fix ligatures and encoding artefacts
+          2. Collapse excessive whitespace
+          3. Remove running headers/footers (heuristic)
 
         Parameters
         ----------
-        text : str
+        result : ExtractionResult
 
         Returns
         -------
-        str
+        CleanResult
         """
-        # TODO (implementation)
-        pass
+        text = result.raw_text
+
+        # Step 1 — Ligature + encoding fix
+        text, ligature_count = TextCleaner._fix_ligatures(text)
+
+        # Step 2 — Whitespace normalisation
+        text = TextCleaner._normalise_whitespace(text)
+
+        # Step 3 — Header/footer removal (only for multi-page docs)
+        lines_removed = 0
+        if result.page_count >= MIN_PAGES_TO_USE_HEURISTIC:
+            text, lines_removed = TextCleaner._remove_headers_footers(
+                text, result.page_count
+            )
+
+        word_count = len(text.split())
+
+        logger.debug(
+            "TextCleaner: ligatures=%d removed_lines=%d words=%d",
+            ligature_count, lines_removed, word_count,
+        )
+
+        return CleanResult(
+            text=text,
+            word_count=word_count,
+            char_count=len(text),
+            ligatures_replaced=ligature_count,
+            lines_removed=lines_removed,
+            extraction_method=result.method.value,
+        )
 
     @staticmethod
-    def remove_page_markers(text: str) -> str:
+    def clean_text(raw_text: str, page_count: int = 1) -> str:
         """
-        Strip "--- PAGE n ---" markers from text.
+        Convenience: clean a raw string directly (no ExtractionResult needed).
 
-        Only called when remove_markers=True is passed to clean().
+        Used by run_preprocessing.py and tests.
+        """
+        from core.types import ExtractionMethod
+        dummy = ExtractionResult(
+            source_path="",
+            raw_text=raw_text,
+            method=ExtractionMethod.TXT_READ,
+            page_count=page_count,
+            metadata={},
+        )
+        return TextCleaner.clean(dummy).text
+
+    # ── Step 1: Ligatures ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _fix_ligatures(text: str) -> tuple[str, int]:
+        """
+        Replace Unicode ligatures and typographic characters with ASCII.
+
+        Returns
+        -------
+        (cleaned_text, number_of_replacements)
+        """
+        count = 0
+        for lig, replacement in LIGATURE_MAP.items():
+            occurrences = text.count(lig)
+            if occurrences:
+                text   = text.replace(lig, replacement)
+                count += occurrences
+
+        # Also fix common mojibake patterns
+        mojibake = {
+            "\u00e2\u20ac\u2122": "'",    # â€™ → '
+            "\u00e2\u20ac\u0153": '"',    # â€œ → "
+            "\u00e2\u20ac\u009d": '"',    # â€  → "
+            "\u00e2\u20ac\u201c": "--",   # â€" → --
+            "\u00e2\u20ac\u201d": "-",    # â€" → -
+            "\u00c2 ": " ",               # Â   → space
+            "\u00c2":  "",                # Â   → empty
+        }
+        for bad, good in mojibake.items():
+            occurrences = text.count(bad)
+            if occurrences:
+                text   = text.replace(bad, good)
+                count += occurrences
+
+        return text, count
+
+    # ── Step 2: Whitespace ────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalise_whitespace(text: str) -> str:
+        """
+        Collapse excessive whitespace without removing meaningful structure.
+
+        Rules:
+          - Strip trailing spaces from each line
+          - Collapse 3+ consecutive blank lines into 2
+          - Normalise Windows line endings (\\r\\n → \\n)
+          - Strip leading/trailing whitespace from the whole document
+        """
+        # Normalise line endings
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        # Strip trailing whitespace per line
+        lines = [line.rstrip() for line in text.split("\n")]
+
+        # Collapse 3+ consecutive blank lines into 2
+        normalised: list[str] = []
+        blank_run = 0
+        for line in lines:
+            if line == "":
+                blank_run += 1
+                if blank_run <= 2:
+                    normalised.append(line)
+            else:
+                blank_run = 0
+                normalised.append(line)
+
+        return "\n".join(normalised).strip()
+
+    # ── Step 3: Headers / footers ─────────────────────────────────────────
+
+    @staticmethod
+    def _remove_headers_footers(text: str, page_count: int) -> tuple[str, int]:
+        """
+        Remove running page headers and footers.
+
+        Heuristic:
+          - Split text at page markers ("--- PAGE N ---")
+          - Collect the first 3 lines and last 3 lines of each page
+          - Any short line (< MAX_HEADER_FOOTER_LEN chars) that appears
+            on MIN_PAGES_FOR_PATTERN or more pages is a header/footer candidate
+          - Remove all occurrences of those lines
 
         Parameters
         ----------
         text : str
+            Already whitespace-normalised text with page markers.
+        page_count : int
+            Number of pages (used to calibrate the threshold).
 
         Returns
         -------
-        str
-            Text with all page markers replaced by a single blank line.
+        tuple[str, int]
+            (cleaned_text, number_of_lines_removed)
         """
-        # TODO: return TextCleaner._PAGE_MARKER_RE.sub("\n\n", text)
-        pass
+        pages = re.split(r"\n*--- PAGE \d+ ---\n*", text)
+        pages = [p for p in pages if p.strip()]
+
+        if len(pages) < MIN_PAGES_FOR_PATTERN:
+            return text, 0
+
+        candidate_lines: list[str] = []
+        for page in pages:
+            page_lines = [l for l in page.split("\n") if l.strip()]
+            # First 3 + last 3 lines
+            candidates = page_lines[:3] + page_lines[-3:]
+            for line in candidates:
+                if 0 < len(line.strip()) < MAX_HEADER_FOOTER_LEN:
+                    candidate_lines.append(line.strip())
+
+        # Count frequency
+        freq      = Counter(candidate_lines)
+        threshold = max(MIN_PAGES_FOR_PATTERN, page_count // 3)
+        bad_lines = {line for line, count in freq.items() if count >= threshold}
+
+        if not bad_lines:
+            return text, 0
+
+        removed = 0
+        clean_lines: list[str] = []
+        for line in text.split("\n"):
+            if line.strip() in bad_lines:
+                removed += 1
+            else:
+                clean_lines.append(line)
+
+        logger.debug(
+            "Header/footer heuristic removed %d lines (%d unique patterns)",
+            removed, len(bad_lines),
+        )
+        return "\n".join(clean_lines), removed

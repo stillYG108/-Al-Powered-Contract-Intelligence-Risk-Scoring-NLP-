@@ -1,132 +1,53 @@
 """
 ingestion/docx_extractor.py
-============================
-Text extractor for Microsoft Word (.docx) files.
+=============================
+Extracts text from Microsoft Word (.docx) files using python-docx.
 
-PURPOSE
--------
-Extracts all readable text from .docx documents using python-docx.
-Handles paragraphs, tables, headers/footers, and inline text runs.
+EXTRACTION STRATEGY (from spec §2.3)
+--------------------------------------
+1. Paragraph text — extracted in document order, joined with newlines
+2. Table cell text — row by row, cells pipe-delimited ("|")
+   Tables appear inline at their document position
 
-WHEN THIS EXTRACTOR IS CHOSEN
-------------------------------
-DocumentRouter calls can_handle() → True for .docx extension.
-This extractor is always definitive for .docx (no auto-detect needed).
-
-LIBRARY: python-docx
---------------------
-python-docx reads the OOXML format (zip of XML files) natively.
-It gives access to Document.paragraphs, Document.tables, and sections.
-
-WHAT IS EXTRACTED (in reading order)
--------------------------------------
-1. Document body paragraphs  (most content)
-2. Table cells  (row by row, cell by cell, joined with " | ")
-3. Headers and footers from each section  (often contain doc title / date)
-4. Text boxes (shapes) are NOT extracted — too complex for Phase 1
-
-TEXT STITCHING STRATEGY
-------------------------
-    [HEADER] {header text}
-    
-    {paragraph 1}
-    {paragraph 2}
-    
-    [TABLE]
-    {row1_col1} | {row1_col2} | {row1_col3}
-    {row2_col1} | {row2_col2} | {row2_col3}
-    
-    [FOOTER] {footer text}
-
-Rationale: preserves structure visible to a human reader while remaining
-clean enough for NER. TextCleaner handles whitespace normalisation.
-
-METADATA INCLUDED IN RESULT
-----------------------------
-{
-    "author": "Jane Smith",
-    "last_modified_by": "John Doe",
-    "created": "2024-01-15T09:00:00",
-    "modified": "2024-03-20T14:30:00",
-    "paragraph_count": 152,
-    "table_count": 3,
-    "word_count": 8421
-}
-
-IMPLEMENTATION NOTES
---------------------
-- Preserve paragraph style names for Phase 2 (heading detection)
-- Skip empty paragraphs (len(para.text.strip()) == 0)
-- python-docx does not handle .doc (binary format) — raise ExtractionError
-  with a clear message directing user to convert to .docx first
-
-USAGE EXAMPLE
+READING ORDER
 -------------
-    from ingestion.docx_extractor import DocxExtractor
-    from pathlib import Path
+python-docx exposes the document body as a flat list of blocks that
+are either Paragraph or Table objects, in their original document
+order. We iterate this list to preserve reading order.
 
+USAGE
+-----
     extractor = DocxExtractor()
-    result = extractor.extract(Path("contract.docx"))
-    print(result.metadata["table_count"])
+    result = extractor.extract(Path("contracts/acme.docx"))
+    print(result.raw_text[:500])
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
-from core.exceptions import ExtractionError  # noqa: F401
-from core.logging import get_logger
 from core.types import ExtractionMethod, ExtractionResult
 
-log = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class DocxExtractor:
     """
     Extracts text from .docx files using python-docx.
 
-    Implements the BaseExtractor Protocol.
-
-    THREAD SAFETY
-    -------------
-    Stateless — safe to share across threads. python-docx Document
-    objects are created per extract() call and not stored as instance state.
+    Satisfies the BaseExtractor Protocol (can_handle + extract).
     """
 
-    SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({".docx"})
+    SUPPORTED_SUFFIXES = {".docx", ".doc"}
 
     def can_handle(self, path: Path) -> bool:
-        """
-        Return True for .docx files only (NOT .doc binary format).
-
-        Parameters
-        ----------
-        path : Path
-
-        Returns
-        -------
-        bool
-        """
-        # TODO: return path.suffix.lower() in self.SUPPORTED_EXTENSIONS
-        pass
+        """Return True for .docx and .doc files."""
+        return path.suffix.lower() in self.SUPPORTED_SUFFIXES
 
     def extract(self, path: Path) -> ExtractionResult:
         """
-        Extract text from a .docx file in reading order.
-
-        Algorithm
-        ---------
-        1. Load document: docx.Document(path)
-        2. Extract core properties (author, dates) from document.core_properties
-        3. Iterate document.paragraphs → collect non-empty paragraph texts
-        4. Iterate document.tables:
-            a. For each row: join cell texts with " | "
-            b. Prefix table block with "[TABLE]\n"
-        5. Iterate document.sections:
-            a. Extract header and footer text if present
-        6. Concatenate all parts with appropriate spacing
-        7. Compute word_count from resulting text
-        8. Return ExtractionResult
+        Extract all text from a .docx file in reading order.
 
         Parameters
         ----------
@@ -136,44 +57,82 @@ class DocxExtractor:
         Returns
         -------
         ExtractionResult
-            raw_text: full document text with structural markers
+            raw_text: paragraphs + tables in document order
             method: ExtractionMethod.DOCX_PARSE
-            page_count: -1 (python-docx does not expose page count)
-            metadata: {author, last_modified_by, created, modified,
-                        paragraph_count, table_count, word_count}
-
-        Raises
-        ------
-        ExtractionError
-            - If path does not exist
-            - If file is .doc (binary) not .docx (raise with helpful message)
-            - If docx.Document() raises BadZipFile (file is corrupted)
+            page_count: 0 (page count not available from python-docx)
+            metadata:
+                paragraph_count (int)
+                table_count (int)
+                word_count (int)
         """
-        # TODO (implementation): python-docx extraction logic
-        pass
+        try:
+            import docx
+        except ImportError:
+            raise ImportError(
+                "python-docx is required for Word document extraction.\n"
+                "Install with: pip install python-docx"
+            )
 
-    def _extract_table_text(self, table) -> str:
-        """
-        Convert a python-docx Table into a pipe-delimited string block.
+        logger.info("DocxExtractor: reading %s", path.name)
 
-        Format:
-            [TABLE]
-            Cell(0,0) | Cell(0,1) | Cell(0,2)
-            Cell(1,0) | Cell(1,1) | Cell(1,2)
+        try:
+            document = docx.Document(str(path))
+        except Exception as exc:
+            raise RuntimeError(
+                f"DocxExtractor: failed to open {path}: {exc}"
+            ) from exc
 
-        Parameters
-        ----------
-        table : docx.table.Table
-            A python-docx Table object.
+        blocks:          list[str] = []
+        paragraph_count: int       = 0
+        table_count:     int       = 0
 
-        Returns
-        -------
-        str
-            Formatted table text block.
+        # Iterate document body in reading order (paragraphs + tables interleaved)
+        for block in document.element.body:
+            tag = block.tag.split("}")[-1] if "}" in block.tag else block.tag
 
-        TESTING NOTE
-        ------------
-        Pure function of a table object → easy to unit test with mock tables.
-        """
-        # TODO (implementation)
-        pass
+            if tag == "p":
+                # Paragraph
+                para = docx.text.paragraph.Paragraph(block, document)
+                text = para.text.strip()
+                if text:
+                    blocks.append(text)
+                    paragraph_count += 1
+
+            elif tag == "tbl":
+                # Table — render each row as "| cell1 | cell2 | ... |"
+                table = docx.table.Table(block, document)
+                table_lines: list[str] = []
+                for row in table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    # Deduplicate merged cells (python-docx repeats merged cells)
+                    deduped = []
+                    prev    = None
+                    for c in cells:
+                        if c != prev:
+                            deduped.append(c)
+                            prev = c
+                    table_lines.append("| " + " | ".join(deduped) + " |")
+                if table_lines:
+                    blocks.append("\n".join(table_lines))
+                    table_count += 1
+
+        full_text  = "\n\n".join(blocks)
+        word_count = len(full_text.split())
+
+        logger.info(
+            "DocxExtractor done: paragraphs=%d tables=%d words=%d",
+            paragraph_count, table_count, word_count,
+        )
+
+        return ExtractionResult(
+            source_path=str(path),
+            raw_text=full_text,
+            method=ExtractionMethod.DOCX_PARSE,
+            page_count=0,          # python-docx doesn't expose page count
+            metadata={
+                "paragraph_count": paragraph_count,
+                "table_count":     table_count,
+                "word_count":      word_count,
+                "extractor":       "python-docx",
+            },
+        )

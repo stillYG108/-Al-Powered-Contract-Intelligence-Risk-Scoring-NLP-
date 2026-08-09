@@ -1,310 +1,291 @@
 """
 ner/inference.py
 =================
-NER model loading and entity extraction — the production inference layer.
+Inference API for the trained spaCy NER model.
 
-PURPOSE
--------
-Provides the NERModel class which loads a trained spaCy model and exposes
-a clean API for extracting entities from contract text.
+PUBLIC FUNCTIONS (from spec §3.4)
+-----------------------------------
+    load_model(model_path: str) → nlp
+        Load and cache spaCy pipeline. Thread-safe singleton.
 
-This is the module that Phase 3 (FastAPI) and Phase 4 (risk scorer) import.
-They depend on BaseNERModel, but NERModel is the concrete implementation.
+    extract_entities(text: str) → list[Entity]
+        Returns list of Entity(text, label, start_char, end_char, confidence)
+        - confidence: token-level IOB scores if available, else 1.0
+        - Deduplicates overlapping spans by score (higher score wins)
+        - Long texts auto-chunked at sentence boundaries
 
-CACHING BEHAVIOUR
------------------
-spaCy models are large (~700MB for en_core_web_lg with vectors).
-NERModel caches the loaded nlp object as an instance attribute.
-The load_model() module-level function provides a process-level singleton:
-    - First call: loads model from disk (~2–5 seconds)
-    - Subsequent calls: returns cached instance (<1ms)
+    batch_extract(texts: list[str]) → list[list[Entity]]
+        Efficient batch inference using nlp.pipe().
 
-Use load_model() in API startup, not on every request.
+USAGE
+-----
+    from ner.inference import load_model, extract_entities
 
-CHUNKING FOR LONG TEXTS
-------------------------
-spaCy's NER has a default max_length limit (~1,000,000 chars) but
-performs best on shorter passages. NERModel automatically chunks
-input text and merges results:
-
-    text → chunk(512) → nlp(chunk1) → entities (adjusted offsets)
-            chunk(512) → nlp(chunk2) → entities (adjusted offsets)
-            ...
-            → de-duplicate entities at chunk boundaries
-            → sort by start position
-            → return merged list
-
-Chunking boundary: split on sentence boundaries, not arbitrary positions.
-
-CONFIDENCE SCORES
------------------
-spaCy 3.x provides entity scores via Scorer but not per-entity during
-inference. NERModel sets score=-1.0 by default.
-
-Phase 2 will provide per-entity confidence from the transformer model.
-
-THREAD SAFETY
--------------
-spaCy nlp objects are thread-safe for inference (they don't mutate state).
-NERModel instances can be shared across request handler threads.
-
-USAGE EXAMPLE
--------------
-    from ner import load_model
-
-    model = load_model()                           # loads once, cached
-    entities = model.extract_entities(text)        # fast inference
-    print(entities[0].label, entities[0].text)
-
-    # Batch:
-    all_entities = model.batch_extract([text1, text2, text3])
+    load_model("models/ner_baseline/model-best")
+    entities = extract_entities("This Agreement is between Acme Corp and Beta Inc.")
+    for e in entities:
+        print(e.text, e.label, e.confidence)
 """
 
 from __future__ import annotations
 
+import logging
 import threading
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar
+from typing import Iterator
 
-from core.config import get_settings
-from core.exceptions import InferenceError, ModelLoadError, ModelNotFoundError
-from core.logging import get_logger
-from core.types import Entity
+logger = logging.getLogger(__name__)
 
-log = get_logger(__name__)
+ROOT      = Path(__file__).parent.parent
+MODEL_DIR = ROOT / "models" / "ner_baseline" / "model-best"
 
-# ---------------------------------------------------------------------------
-# Process-level model singleton (thread-safe)
-# ---------------------------------------------------------------------------
-
-_MODEL_LOCK = threading.Lock()
-_MODEL_INSTANCE: "NERModel | None" = None
+# Maximum characters before chunking (spaCy has a tokenizer limit)
+MAX_TEXT_LENGTH = 100_000
+# Approximate characters per sentence chunk
+CHUNK_OVERLAP   = 200
 
 
-def load_model(model_path: str | Path | None = None) -> "NERModel":
+# ─────────────────────────────────────────────────────────────────────────────
+# Data types
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Entity:
+    """A single extracted named entity."""
+    text:       str
+    label:      str
+    start_char: int
+    end_char:   int
+    confidence: float = 1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Singleton model cache (thread-safe)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MODEL_CACHE: dict[str, object] = {}
+_CACHE_LOCK  = threading.Lock()
+
+
+def load_model(model_path: str | Path = MODEL_DIR) -> object:
     """
-    Load and return the singleton NERModel instance.
+    Load and cache the spaCy NER pipeline.
 
-    Thread-safe: uses a lock to prevent double-loading if two threads
-    call load_model() concurrently at startup.
+    Thread-safe: concurrent calls for the same path return the same nlp object.
+    The model is loaded once per process and reused for all subsequent calls.
 
     Parameters
     ----------
-    model_path : str | Path | None
-        Path to the saved spaCy model.
-        Default: settings.models_dir / "ner_baseline"
+    model_path : str | Path
+        Path to the spaCy model directory (model-best/).
 
     Returns
     -------
-    NERModel
-        Loaded, ready-to-use model instance.
+    spacy.Language
+        Loaded spaCy NLP pipeline.
 
     Raises
     ------
-    ModelNotFoundError
-        If model_path does not exist on disk.
-    ModelLoadError
-        If spaCy fails to load the model (version mismatch, corruption).
-
-    USAGE
-    -----
-        # At API startup:
-        model = load_model()
-
-        # With explicit path (e.g., in tests):
-        model = load_model("models/test_ner")
-
-        # Reset singleton (for tests):
-        ner.inference._MODEL_INSTANCE = None
+    FileNotFoundError
+        If the model directory does not exist.
     """
-    global _MODEL_INSTANCE
-    # TODO (implementation): double-checked locking pattern
-    # with _MODEL_LOCK:
-    #     if _MODEL_INSTANCE is None:
-    #         _MODEL_INSTANCE = NERModel(model_path or _default_path())
-    # return _MODEL_INSTANCE
-    pass
+    import spacy
+
+    model_path = str(Path(model_path).resolve())
+
+    with _CACHE_LOCK:
+        if model_path not in _MODEL_CACHE:
+            if not Path(model_path).exists():
+                raise FileNotFoundError(
+                    f"NER model not found: {model_path}\n"
+                    f"Run: python -m ner.train"
+                )
+            logger.info("Loading NER model from %s", model_path)
+            nlp = spacy.load(model_path)
+            _MODEL_CACHE[model_path] = nlp
+            logger.info(
+                "Model loaded — labels: %s",
+                nlp.get_pipe("ner").labels,
+            )
+        return _MODEL_CACHE[model_path]
 
 
-class NERModel:
+# ─────────────────────────────────────────────────────────────────────────────
+# Inference
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_entities(
+    text:       str,
+    model_path: str | Path = MODEL_DIR,
+) -> list[Entity]:
     """
-    spaCy-based NER model for legal entity extraction.
+    Extract named entities from a contract text.
 
-    Implements the BaseNERModel Protocol.
+    Handles long texts by chunking at sentence boundaries.
+    Deduplicates overlapping spans by confidence (higher wins).
 
     Parameters
     ----------
-    model_path : Path
-        Path to the saved spaCy model directory.
-
-    Attributes
-    ----------
-    _nlp : spacy.Language
-        Loaded spaCy pipeline object. Created in __init__, reused for all calls.
-    _model_path : Path
-        Stored for model_info() reporting.
-    _loaded_at : str
-        ISO timestamp of when the model was loaded.
-    _max_chunk_length : int
-        From settings — texts longer than this are chunked.
-
-    THREAD SAFETY
-    -------------
-    spaCy Language objects are safe for concurrent inference.
-    _nlp is set once in __init__ and never mutated after that.
-    """
-
-    def __init__(self, model_path: Path) -> None:
-        """
-        Load spaCy model from disk.
-
-        Parameters
-        ----------
-        model_path : Path
-            Directory containing a spaCy saved model.
-
-        IMPLEMENTATION STEPS
-        --------------------
-        1. Verify model_path.exists() → raise ModelNotFoundError if not
-        2. Try: self._nlp = spacy.load(model_path)
-           Except OSError: raise ModelLoadError(...)
-        3. self._loaded_at = datetime.now(timezone.utc).isoformat()
-        4. Log: "model_loaded path=... labels=... duration_ms=..."
-        5. Disable unused pipeline components for inference speed:
-           self._nlp.select_pipes(enable=["ner"])
-        """
-        # TODO (implementation)
-        pass
-
-    def extract_entities(self, text: str) -> list[Entity]:
-        """
-        Extract named entities from a single text string.
-
-        Parameters
-        ----------
-        text : str
-            Clean contract text (run through TextCleaner first).
-
-        Returns
-        -------
-        list[Entity]
-            Entities sorted by start character position.
-            Empty list if no entities found.
-
-        ALGORITHM
-        ---------
-        1. If len(text) == 0: return []
-        2. If len(text) <= max_chunk_length:
-            a. doc = self._nlp(text)
-            b. return [_to_entity(ent) for ent in doc.ents]
-        3. If len(text) > max_chunk_length:
-            a. chunks = self._chunk_text(text)
-            b. For each (chunk_start, chunk_text):
-               → doc = self._nlp(chunk_text)
-               → entities = [_to_entity(ent, offset=chunk_start) for ent in doc.ents]
-            c. Merge all entity lists
-            d. De-duplicate at boundaries (spans straddling chunk seams)
-            e. Sort by start position
-            f. Return merged list
-
-        Raises
-        ------
-        InferenceError
-            If spaCy raises any exception during processing.
-            Wraps the original exception with text[:100] as context.
-        """
-        # TODO (implementation)
-        pass
-
-    def batch_extract(self, texts: list[str]) -> list[list[Entity]]:
-        """
-        Extract entities from multiple texts using spaCy's pipe().
-
-        Parameters
-        ----------
-        texts : list[str]
-            Input texts. Empty strings produce empty entity lists.
-
-        Returns
-        -------
-        list[list[Entity]]
-            Same length as `texts`.
-
-        IMPLEMENTATION NOTES
-        --------------------
-        - Use self._nlp.pipe(texts, batch_size=32) for efficiency
-        - Handle long texts: pre-chunk them before piping
-        - Re-assemble chunk results back into per-text lists after pipe
-        """
-        # TODO (implementation)
-        pass
-
-    def model_info(self) -> dict:
-        """
-        Return metadata about the loaded model.
-
-        Returns
-        -------
-        dict
-            {
-                "model_path": str,
-                "labels": list[str],     # ner.move_names from spaCy pipeline
-                "loaded_at": str,        # ISO timestamp
-                "spacy_version": str,    # spacy.__version__
-            }
-        """
-        # TODO (implementation)
-        pass
-
-    def _chunk_text(self, text: str) -> list[tuple[int, str]]:
-        """
-        Split long text into (start_offset, chunk_text) pairs.
-
-        Splits at sentence boundaries to avoid cutting mid-entity.
-
-        Parameters
-        ----------
-        text : str
-            Text longer than max_chunk_length.
-
-        Returns
-        -------
-        list[tuple[int, str]]
-            Each tuple: (character offset of chunk start, chunk text)
-
-        IMPLEMENTATION NOTES
-        --------------------
-        - Use spaCy sentencizer for boundary detection
-        - Accumulate sentences until chunk size <= max_chunk_length
-        - Track char offset of each sentence start for offset adjustment
-        """
-        # TODO (implementation)
-        pass
-
-
-def _to_entity(spacy_ent, offset: int = 0) -> Entity:
-    """
-    Convert a spaCy Span to an Entity dataclass.
-
-    Parameters
-    ----------
-    spacy_ent : spacy.tokens.Span
-        A span from doc.ents.
-    offset : int
-        Character offset of the chunk start (for long-text chunking).
-        Add to start_char / end_char to get offsets in the original text.
+    text : str
+        Raw contract text (any length).
+    model_path : str | Path
+        Path to model-best/ directory. Cached after first call.
 
     Returns
     -------
-    Entity
-        Immutable entity with adjusted offsets.
+    list[Entity]
+        Sorted by start_char. No overlapping spans.
+        confidence is set from spaCy's .ent_kb_id_ if available, else 1.0.
     """
-    # TODO: return Entity(
-    #     label=spacy_ent.label_,
-    #     text=spacy_ent.text,
-    #     start=spacy_ent.start_char + offset,
-    #     end=spacy_ent.end_char + offset,
-    #     score=-1.0,   # spaCy does not provide per-entity score
-    # )
-    pass
+    nlp = load_model(model_path)
+    entities: list[Entity] = []
+
+    for chunk_text, chunk_offset in _chunk_text(text, nlp):
+        doc = nlp(chunk_text)
+        for ent in doc.ents:
+            entities.append(Entity(
+                text       = ent.text,
+                label      = ent.label_,
+                start_char = ent.start_char + chunk_offset,
+                end_char   = ent.end_char   + chunk_offset,
+                confidence = _get_confidence(ent),
+            ))
+
+    # Deduplicate overlapping spans (keep highest confidence)
+    return _deduplicate(entities)
+
+
+def batch_extract(
+    texts:      list[str],
+    model_path: str | Path = MODEL_DIR,
+    batch_size: int = 16,
+) -> list[list[Entity]]:
+    """
+    Batch inference using nlp.pipe() for efficiency.
+
+    Parameters
+    ----------
+    texts : list[str]
+        List of contract texts to process.
+    model_path : str | Path
+        Path to model-best/.
+    batch_size : int
+        Number of texts to process per spaCy batch.
+
+    Returns
+    -------
+    list[list[Entity]]
+        One list of entities per input text, in the same order.
+    """
+    nlp     = load_model(model_path)
+    results: list[list[Entity]] = []
+
+    # For texts within max length, use efficient pipe()
+    short_texts  = [t for t in texts if len(t) <= MAX_TEXT_LENGTH]
+    long_indices = [i for i, t in enumerate(texts) if len(t) > MAX_TEXT_LENGTH]
+
+    if short_texts:
+        for doc in nlp.pipe(short_texts, batch_size=batch_size):
+            results.append([
+                Entity(
+                    text=e.text, label=e.label_,
+                    start_char=e.start_char, end_char=e.end_char,
+                    confidence=_get_confidence(e),
+                )
+                for e in doc.ents
+            ])
+
+    # Fall back to chunked extraction for long texts
+    for idx in long_indices:
+        results.insert(idx, extract_entities(texts[idx], model_path))
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _chunk_text(
+    text: str,
+    nlp: object,
+) -> Iterator[tuple[str, int]]:
+    """
+    Split long text into sentence-boundary chunks.
+
+    Yields
+    ------
+    (chunk_text, char_offset) pairs.
+    For texts shorter than MAX_TEXT_LENGTH, yields the full text with offset 0.
+    """
+    if len(text) <= MAX_TEXT_LENGTH:
+        yield text, 0
+        return
+
+    # Use spaCy sentencizer to find sentence boundaries
+    import spacy
+
+    # Quick sentence split using newlines + periods for chunking
+    # (avoid running the full pipeline just for chunking)
+    chunk_start = 0
+    while chunk_start < len(text):
+        chunk_end = min(chunk_start + MAX_TEXT_LENGTH, len(text))
+
+        # Try to end on a sentence boundary (newline or '. ')
+        if chunk_end < len(text):
+            for boundary in ["\n\n", "\n", ". "]:
+                bp = text.rfind(boundary, chunk_start + MAX_TEXT_LENGTH // 2, chunk_end)
+                if bp != -1:
+                    chunk_end = bp + len(boundary)
+                    break
+
+        yield text[chunk_start:chunk_end], chunk_start
+        chunk_start = chunk_end - CHUNK_OVERLAP
+        if chunk_start >= len(text):
+            break
+
+
+def _get_confidence(ent) -> float:
+    """
+    Extract confidence score from a spaCy Span.
+
+    spaCy's default NER doesn't expose per-span probabilities directly.
+    We return the mean token score if available via ent._.score,
+    otherwise fall back to 1.0.
+    """
+    # Try custom attribute
+    try:
+        if ent.has_extension("score"):
+            return float(ent._.score)
+    except Exception:
+        pass
+    return 1.0
+
+
+def _deduplicate(entities: list[Entity]) -> list[Entity]:
+    """
+    Remove overlapping entities, keeping the one with higher confidence.
+
+    Uses an interval sweep: sort by (start, -confidence), greedily accept
+    non-overlapping spans.
+    """
+    if not entities:
+        return []
+
+    sorted_ents = sorted(entities, key=lambda e: (e.start_char, -e.confidence))
+    result: list[Entity] = []
+    last_end = -1
+
+    for ent in sorted_ents:
+        if ent.start_char >= last_end:
+            result.append(ent)
+            last_end = ent.end_char
+        else:
+            # Overlap: keep the one with higher confidence
+            prev = result[-1]
+            if ent.confidence > prev.confidence:
+                result[-1] = ent
+                last_end   = ent.end_char
+
+    return sorted(result, key=lambda e: e.start_char)

@@ -39,7 +39,9 @@ class DocumentRouter:
             file_path.suffix.lower()
         )
 
+        # ==================================
         # PDF
+        # ==================================
 
         if extension == ".pdf":
 
@@ -47,7 +49,9 @@ class DocumentRouter:
                 file_path
             )
 
+        # ==================================
         # DOCX
+        # ==================================
 
         elif extension == ".docx":
 
@@ -77,8 +81,10 @@ class DocumentRouter:
         print("PDF EXTRACTION")
         print("==============================")
 
-
+        # ----------------------------------
+        # Step 1
         # Digital PDF extraction
+        # ----------------------------------
 
         pdf_result = (
             self.pdf_extractor.extract(
@@ -95,7 +101,10 @@ class DocumentRouter:
             flagged
         )
 
+        # ----------------------------------
+        # Step 2
         # OCR flagged pages
+        # ----------------------------------
 
         final_pages = list(
             pdf_result["pages"]
@@ -138,13 +147,19 @@ class DocumentRouter:
 
             method = "pdfminer+ocr"
 
+        # ----------------------------------
+        # Step 3
         # Reassemble
+        # ----------------------------------
 
         final_text = "\n\n".join(
             final_pages
         )
-        
+
+        # ----------------------------------
+        # Step 4
         # Clean
+        # ----------------------------------
 
         result = self.cleaner.clean(
             final_text,

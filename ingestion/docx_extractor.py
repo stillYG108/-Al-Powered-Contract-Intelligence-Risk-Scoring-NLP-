@@ -20,7 +20,9 @@ class DocxExtractor:
 
         parts = []
 
+        # ----------------------------------
         # Paragraphs
+        # ----------------------------------
 
         for paragraph in document.paragraphs:
 

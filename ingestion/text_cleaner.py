@@ -31,14 +31,18 @@ class TextCleaner:
                 }
             }
 
+        # ----------------------------------
         # Unicode normalization
+        # ----------------------------------
 
         text = unicodedata.normalize(
             "NFKC",
             text
         )
 
+        # ----------------------------------
         # Ligatures
+        # ----------------------------------
 
         for old, new in self.LIGATURES.items():
 
@@ -47,7 +51,9 @@ class TextCleaner:
                 new
             )
 
+        # ----------------------------------
         # Whitespace
+        # ----------------------------------
 
         text = text.replace(
             "\r\n",
@@ -71,12 +77,16 @@ class TextCleaner:
             text
         )
 
+        # ----------------------------------
         # Remove empty lines at edges
-       
+        # ----------------------------------
+
         text = text.strip()
 
+        # ----------------------------------
         # Header/footer detection
-        
+        # ----------------------------------
+
         if pages and len(pages) > 1:
 
             repeated = (
@@ -94,8 +104,10 @@ class TextCleaner:
 
             text = "\n".join(lines)
 
+        # ----------------------------------
         # Metadata
-        
+        # ----------------------------------
+
         metadata = {
             "pages": (
                 len(pages)

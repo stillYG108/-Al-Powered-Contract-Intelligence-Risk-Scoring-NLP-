@@ -1,384 +1,153 @@
-
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytesseract
-
 from pdf2image import convert_from_path
-from PIL import Image
+
+
+# --------------------------------------------------
+# TESSERACT
+# --------------------------------------------------
 
 pytesseract.pytesseract.tesseract_cmd = (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 )
 
-class OCRResult:
 
-    def __init__(
-        self,
-        text,
-        pages,
-        metadata
-    ):
+# --------------------------------------------------
+# POPPLER
+# --------------------------------------------------
 
-        self.text = text
-        self.pages = pages
-        self.metadata = metadata
+POPPLER_PATH = (r"C:\Program Files\Release-26.02.0-0\poppler-26.02.0\Library\bin")
 
 
+# --------------------------------------------------
+# OCR EXTRACTOR
+# --------------------------------------------------
 
 class OcrExtractor:
 
-
     OCR_CONFIG = "--oem 3 --psm 6"
 
+    def extract(self, pdf_file, pages=None):
 
+        pdf_file = Path(pdf_file)
 
-    def extract(
-        self,
-        pdf_path,
-        pages=None
-    ):
-
-        """
-        Extract text from scanned PDF.
-
-        Parameters
-        ----------
-        pdf_path:
-            PDF file path
-
-        pages:
-            List of page numbers to OCR.
-            Example:
-            [2,5,7]
-
-            If None:
-            OCR entire PDF
-
-        """
-
-        pdf_path = Path(pdf_path)
-
-
-        if not pdf_path.exists():
-
+        if not pdf_file.exists():
             raise FileNotFoundError(
-                "PDF file not found"
+                f"PDF not found: {pdf_file}"
             )
 
+        if pdf_file.suffix.lower() != ".pdf":
+            raise ValueError(
+                "Only PDF files are supported."
+            )
 
-        # Convert PDF pages to images
+        print(
+            f"\nOCR file: {pdf_file.name}"
+        )
 
         images = convert_from_path(
-
-            pdf_path,
-
+            str(pdf_file),
             dpi=300,
-
-            poppler_path=r"C:\Users\Sujal  Jethwa\Downloads\Release-26.02.0-0\poppler-26.02.0\Library\bin"
-
+            poppler_path=POPPLER_PATH
         )
-        print(len(images), "images converted from pdf")
 
+        print(
+            f"Converted {len(images)} page(s)"
+        )
 
         extracted_pages = []
 
+        for number, image in enumerate(
+            images,
+            start=1
+        ):
 
-        full_text = ""
-
-
-
-        for index, image in enumerate(images):
-
-
-            page_number = index + 1
-
-
-
-            # OCR only selected pages
-
-            if pages and page_number not in pages:
-
-                continue
-
-
+            # If router supplied specific pages
+            if pages is not None:
+                if number not in pages:
+                    continue
 
             print(
-                f"OCR processing page {page_number}"
+                f"OCR processing page {number}"
             )
 
-
-            processed_image = (
-                self.preprocess_image(
-                    image
-                )
+            processed = (
+                self.preprocess_image(image)
             )
-
 
             text = pytesseract.image_to_string(
-
-                processed_image,
-
+                processed,
                 config=self.OCR_CONFIG
-
             )
-
 
             text = text.strip()
 
+            extracted_pages.append({
+                "page": number,
+                "text": text
+            })
 
+        # Reassemble pages
+        page_texts = []
 
-            page_output = (
+        for page in extracted_pages:
 
-                f"\n\n--- PAGE {page_number} ---\n\n"
-
-                + text
-
+            page_texts.append(
+                f"--- PAGE {page['page']} ---\n"
+                f"{page['text']}"
             )
 
+        full_text = "\n\n".join(
+            page_texts
+        )
 
-
-            extracted_pages.append(
-
-                {
-                    "page": page_number,
-                    "text": text
-                }
-
-            )
-
-
-            full_text += page_output
-
-
-
-        metadata = {
-
-
-            "file_name":
-                pdf_path.name,
-
-
-            "pages_processed":
-                len(extracted_pages),
-
-
-            "ocr_engine":
-                "tesseract",
-
-
-            "dpi":
-                300,
-
-
-            "config":
-                self.OCR_CONFIG
-
-
+        return {
+            "text": full_text,
+            "pages": extracted_pages,
+            "metadata": {
+                "file_name": pdf_file.name,
+                "pages_processed": len(
+                    extracted_pages
+                ),
+                "extraction_method": "ocr",
+                "ocr_engine": "tesseract",
+                "dpi": 300,
+                "config": self.OCR_CONFIG
+            }
         }
 
+    # --------------------------------------------------
+    # PREPROCESSING
+    # --------------------------------------------------
 
+    def preprocess_image(self, image):
 
-        return OCRResult(
+        # PIL -> NumPy
+        image = np.array(image)
 
-            text=full_text,
-
-            pages=extracted_pages,
-
-            metadata=metadata
-
-        )
-
-
-
-    def preprocess_image(
-        self,
-        image
-    ):
-
-        """
-        Image preprocessing pipeline:
-
-        1. RGB -> Grayscale
-        2. Adaptive thresholding
-        3. Deskew using Tesseract OSD
-        4. Noise removal
-
-        """
-
-
-        # PIL Image -> OpenCV
-
-        img = np.array(image)
-
-
-
-        # RGB -> Gray
-
+        # RGB -> grayscale
         gray = cv2.cvtColor(
-
-            img,
-
+            image,
             cv2.COLOR_RGB2GRAY
-
         )
-
-
 
         # Adaptive threshold
-
         threshold = cv2.adaptiveThreshold(
-
             gray,
-
             255,
-
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-
             cv2.THRESH_BINARY,
-
             31,
-
             11
-
         )
 
-
-
-        # Deskew
-
-        rotated = self.correct_skew(
-
-            threshold
-
-        )
-
-
-
-        # Remove noise
-
-        denoised = cv2.medianBlur(
-
-            rotated,
-
+        # Denoising
+        cleaned = cv2.medianBlur(
+            threshold,
             3
-
         )
 
-
-        return denoised
-
-
-
-    def correct_skew(
-        self,
-        image
-    ):
-
-        """
-        Deskew image using Tesseract OSD.
-
-        """
-
-        try:
-
-            osd = pytesseract.image_to_osd(
-
-                image
-
-            )
-
-
-            rotation = 0
-
-
-            for line in osd.split("\n"):
-
-
-                if "Rotate" in line:
-
-                    rotation = int(
-
-                        line.split(":")[1]
-
-                        .strip()
-
-                    )
-
-
-
-            if rotation == 90:
-
-                image = cv2.rotate(
-
-                    image,
-
-                    cv2.ROTATE_90_CLOCKWISE
-
-                )
-
-
-            elif rotation == 180:
-
-                image = cv2.rotate(
-
-                    image,
-
-                    cv2.ROTATE_180
-
-                )
-
-
-            elif rotation == 270:
-
-                image = cv2.rotate(
-
-                    image,
-
-                    cv2.ROTATE_90_COUNTERCLOCKWISE
-
-                )
-
-
-
-        except Exception:
-
-            # If OSD fails,
-            # continue without rotation
-
-            pass
-
-
-
-        return image
-
-ocr = OcrExtractor()
-
-
-try:
-
-    result = ocr.extract(
-        "contract.pdf"
-    )
-
-
-    print("OCR Successful")
-
-    print("----------------")
-
-    print(result.metadata)
-
-
-    print("\nOCR Text:")
-
-    print(result.text[:10000])
-
-
-except Exception as e:
-
-    print("OCR Error:")
-
-    print(type(e).__name__)
-
-    print(e)
+        return cleaned

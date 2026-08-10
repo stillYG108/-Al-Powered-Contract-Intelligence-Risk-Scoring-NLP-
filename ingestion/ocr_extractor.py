@@ -5,26 +5,18 @@ import numpy as np
 import pytesseract
 from pdf2image import convert_from_path
 
-
-# --------------------------------------------------
 # TESSERACT
-# --------------------------------------------------
 
 pytesseract.pytesseract.tesseract_cmd = (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 )
 
-
-# --------------------------------------------------
 # POPPLER
-# --------------------------------------------------
 
 POPPLER_PATH = (r"C:\Program Files\Release-26.02.0-0\poppler-26.02.0\Library\bin")
 
 
-# --------------------------------------------------
 # OCR EXTRACTOR
-# --------------------------------------------------
 
 class OcrExtractor:
 
@@ -119,9 +111,7 @@ class OcrExtractor:
             }
         }
 
-    # --------------------------------------------------
     # PREPROCESSING
-    # --------------------------------------------------
 
     def preprocess_image(self, image):
 
